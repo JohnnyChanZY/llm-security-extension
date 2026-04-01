@@ -1,6 +1,8 @@
 """
 配置管理模块
 负责加载和管理应用程序配置
+
+所有敏感配置从 .env 文件读取，请复制 .env.example 为 .env 并填写实际值
 """
 from pydantic_settings import BaseSettings
 from typing import Optional
@@ -16,13 +18,13 @@ class Settings(BaseSettings):
     debug: bool = True
 
     # 数据库配置
-    database_url: str = "mysql+pymysql://root:Johnny2004@localhost:3306/llm_security"
+    database_url: str = ""
 
     # NVD API配置
-    nvd_api_key: str = "84b20dc6-1526-42ee-be8a-0ff22324fed0"
+    nvd_api_key: Optional[str] = None
 
     # AIID API配置
-    aiid_api_key: str = "user:gh.5d5d398d-de57-4892-af41-3d574595e4a3:pa7CieIaoqHD_lIu6Klghw"
+    aiid_api_key: Optional[str] = None
 
     # LLM API配置 (通用配置，支持腾讯云等)
     llm_api_key: str = ""
@@ -30,7 +32,7 @@ class Settings(BaseSettings):
     llm_model: str = "glm-5"
 
     # JWT配置
-    jwt_secret_key: str = "your-secret-key-change-in-production"
+    jwt_secret_key: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
