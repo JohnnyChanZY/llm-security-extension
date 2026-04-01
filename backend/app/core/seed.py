@@ -122,11 +122,10 @@ def seed_system_configs(db: Session):
     ]
 
     configs = [
-        {"config_key": "llm_classify_enabled", "config_value": "false", "description": "LLM自动分类开关"},
-        {"config_key": "llm_rating_enabled", "config_value": "false", "description": "LLM自动评级开关"},
-        {"config_key": "llm_batch_size", "config_value": "30", "description": "LLM单批次处理事件数量（手动和自动通用）"},
-        {"config_key": "llm_max_concurrent_batches", "config_value": "3", "description": "LLM并行处理最大批次数（判断和评级通用）"},
-        {"config_key": "llm_request_interval", "config_value": "2", "description": "LLM请求间隔时间（秒），每批并发请求之间的等待时间"},
+        {"config_key": "llm_rating_enabled", "config_value": "false", "description": "LLM自动评级开关（与分类开关独立）"},
+        {"config_key": "llm_classify_enabled", "config_value": "false", "description": "LLM自动分类开关（与评级开关独立）"},
+        {"config_key": "llm_batch_size", "config_value": "30", "description": "LLM单批次处理事件数量"},
+        {"config_key": "llm_request_interval", "config_value": "2", "description": "LLM请求间隔时间（秒）"},
         {"config_key": "keyword_filter_enabled", "config_value": "true", "description": "关键词筛选开关"},
         {"config_key": "filter_keywords", "config_value": json.dumps(default_keywords, ensure_ascii=False), "description": "筛选关键词列表(JSON数组)"},
     ]

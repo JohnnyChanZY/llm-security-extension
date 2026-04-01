@@ -10,7 +10,7 @@ from app.models.user import User
 from app.models.model import Model
 from app.schemas.model import ModelCreate, ModelUpdate, ModelResponse
 from app.schemas.response import ResponseModel
-from app.api.deps import get_current_admin
+from app.api.deps import get_current_admin, not_found_exception
 
 router = APIRouter()
 
@@ -38,7 +38,7 @@ def create_model(
     current_admin: User = Depends(get_current_admin),
     db: Session = Depends(get_db)
 ):
-    """新增模型"""
+    """创建模型"""
     model = Model(
         name=model_data.name,
         vendor=model_data.vendor,
@@ -68,14 +68,7 @@ def update_model(
     model = db.query(Model).filter(Model.id == model_id).first()
 
     if not model:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "code": 1005,
-                "message": "模型不存在",
-                "data": None
-            }
-        )
+        raise not_found_exception("模型不存在")
 
     if update_data.name is not None:
         model.name = update_data.name
@@ -108,14 +101,7 @@ def delete_model(
     model = db.query(Model).filter(Model.id == model_id).first()
 
     if not model:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "code": 1005,
-                "message": "模型不存在",
-                "data": None
-            }
-        )
+        raise not_found_exception("模型不存在")
 
     db.delete(model)
     db.commit()

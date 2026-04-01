@@ -61,7 +61,8 @@ export const rssApi = {
   update: (id: number, data: any) => api.put(`/admin/rss-sources/${id}`, data),
   delete: (id: number) => api.delete(`/admin/rss-sources/${id}`),
   validate: (id: number) => api.post(`/admin/rss-sources/${id}/validate`),
-  crawl: (id: number) => api.post(`/admin/rss-sources/${id}/crawl`)
+  crawl: (id: number) => api.post(`/admin/rss-sources/${id}/crawl`),
+  crawlAll: () => api.post('/admin/rss-sources/actions/crawl-all')
 }
 
 // 模型管理API
@@ -98,21 +99,12 @@ export const llmEventsApi = {
   getEvents: (params: any) => api.get('/admin/events', { params }),
   // 获取事件统计
   getStats: () => api.get('/admin/events/stats'),
-  // 批量评级 (LLM调用耗时较长，设置2分钟超时)
-  rate: (data: { event_ids: number[], event_type: string }) =>
-    api.post('/admin/rating/rate', { ...data, mode: 'rate' }, { timeout: 120000 }),
-  // 批量分类 (LLM调用耗时较长，设置2分钟超时)
-  classify: (data: { event_ids: number[], event_type: string }) =>
-    api.post('/admin/rating/classify', data, { timeout: 120000 }),
-  // 评级+分类 (LLM调用耗时较长，设置2分钟超时)
-  rateAndClassify: (data: { event_ids: number[], event_type: string }) =>
-    api.post('/admin/rating/rate-and-classify', data, { timeout: 120000 }),
-  // 判断是否安全事件 (LLM调用耗时较长，设置2分钟超时)
-  checkSecurity: (data: { event_ids: number[], event_type: string }) =>
-    api.post('/admin/rating/check-security', data, { timeout: 120000 }),
-  // 批量操作（复选框模式）- 支持多操作组合执行
-  batchOperations: (data: { event_ids: number[], event_type: string, operations: string[] }) =>
-    api.post('/admin/rating/batch-operations', data, { timeout: 180000 }),
+  // 复用 ratingApi 的方法
+  rate: ratingApi.rate,
+  classify: ratingApi.classify,
+  rateAndClassify: ratingApi.rateAndClassify,
+  checkSecurity: ratingApi.checkSecurity,
+  batchOperations: ratingApi.batchOperations,
   // 删除单个事件
   deleteEvent: (eventId: number, eventTable: string) =>
     api.delete(`/admin/events/${eventTable}/${eventId}`),

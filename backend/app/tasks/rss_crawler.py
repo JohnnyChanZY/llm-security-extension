@@ -14,13 +14,37 @@ from app.services.keyword_filter import filter_rss_events_batch, is_keyword_filt
 logger = logging.getLogger(__name__)
 
 
-def crawl_all_sources():
-    """爬取所有活跃的RSS源"""
-    db = SessionLocal()
+def crawl_all_sources(db: Session = None):
+    """
+    爬取所有活跃的RSS源
+
+    Args:
+        db: 数据库session，如果为None则自动创建
+
+    Returns:
+        dict: {
+            "total": 新增事件总数,
+            "passed_filter": 通过关键词筛选的数量,
+            "filtered": 被过滤的数量,
+            "sources_count": 处理的RSS源数量,
+            "failed_count": 失败的RSS源数量
+        }
+    """
+    own_db = db is None
+    if own_db:
+        db = SessionLocal()
+
     try:
         sources = db.query(RSSSource).filter(RSSSource.is_active == True).all()
 
-        total_stats = {"total": 0, "passed_filter": 0, "filtered": 0}
+        total_stats = {
+            "total": 0,
+            "passed_filter": 0,
+            "filtered": 0,
+            "sources_count": len(sources),
+            "failed_count": 0
+        }
+
         for source in sources:
             try:
                 result = crawl_source(source, db)
@@ -29,11 +53,14 @@ def crawl_all_sources():
                 total_stats["filtered"] += result["filtered"]
             except Exception as e:
                 logger.error(f"爬取RSS源 {source.name} 失败: {e}")
+                total_stats["failed_count"] += 1
 
         db.commit()
         logger.info(f"所有RSS源爬取完成: 新增 {total_stats['total']} 条，通过筛选 {total_stats['passed_filter']} 条，过滤 {total_stats['filtered']} 条")
+        return total_stats
     finally:
-        db.close()
+        if own_db:
+            db.close()
 
 
 def crawl_source(source: RSSSource, db: Session) -> dict:

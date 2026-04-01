@@ -72,7 +72,6 @@
           <el-input v-model="filters.keyword" placeholder="搜索标题/描述" clearable style="width: 180px;" />
         </el-form-item>
         <el-form-item>
-          <el-button type="primary" @click="loadEvents">搜索</el-button>
           <el-button @click="resetFilters">重置</el-button>
         </el-form-item>
       </el-form>
@@ -81,17 +80,38 @@
     <!-- 批量操作区域 -->
     <el-card class="actions-card">
       <!-- 进度条 -->
-      <div v-if="taskStatus.running" class="progress-bar">
+      <div v-if="taskStatus.running || processing" class="progress-bar">
         <el-progress
+          v-if="taskStatus.running && taskStatus.total > 0"
           :percentage="Math.round((taskStatus.processed / taskStatus.total) * 100)"
           :format="() => `${taskStatus.processed}/${taskStatus.total}`"
           :stroke-width="20"
           striped
           striped-flow
         />
+        <el-progress
+          v-else-if="processing"
+          :percentage="100"
+          :stroke-width="20"
+          :indeterminate="true"
+        />
         <span class="progress-text">
-          处理中... 第 {{ taskStatus.current_batch }}/{{ taskStatus.total_batches }} 批
+          <template v-if="taskStatus.running">
+            处理中... 第 {{ taskStatus.current_batch }}/{{ taskStatus.total_batches }} 批
+          </template>
+          <template v-else-if="processing">
+            正在启动...
+          </template>
         </span>
+        <el-button
+          v-if="taskStatus.running"
+          type="danger"
+          size="small"
+          @click="stopTask"
+          :loading="stopping"
+        >
+          停止
+        </el-button>
       </div>
 
       <div class="actions-bar">
@@ -218,7 +238,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Link } from '@element-plus/icons-vue'
 import { llmEventsApi, ratingApi } from '@/api'
@@ -281,9 +301,13 @@ interface RatingStatus {
 
 const loading = ref(false)
 const processing = ref(false)
+const stopping = ref(false)
 const events = ref<Event[]>([])
 const selectedEvents = ref<Event[]>([])
 const stats = ref<Stats>({})
+
+// 任务启动标记（用于检测任务立即完成的情况）
+const taskStarted = ref(false)
 
 // 选中的操作类型
 const selectedOperations = ref<string[]>([])
@@ -316,10 +340,34 @@ const pagination = reactive({
   total: 0
 })
 
+// 是否已完成初始化（防止初始化时触发多次搜索）
+const initialized = ref(false)
+
+// 监听筛选条件变化，自动触发搜索
+watch(
+  () => [
+    filters.source_type,
+    filters.is_processed,
+    filters.is_security_event,
+    filters.severity,
+    filters.keyword
+  ],
+  () => {
+    if (!initialized.value) return
+    // 筛选条件变化时重置页码并搜索
+    pagination.page = 1
+    loadEvents()
+  }
+)
+
+// 分页变化时自动搜索（通过 @size-change 和 @current-change 已实现）
+
 onMounted(() => {
   loadStats()
   loadEvents()
   checkTaskStatus()
+  // 标记初始化完成
+  initialized.value = true
 })
 
 onUnmounted(() => {
@@ -364,19 +412,23 @@ async function checkTaskStatus() {
         }
       }
 
-      // 任务完成
-      if (!res.data.running && prevRunning) {
+      // 任务完成（包括任务立即完成的情况）
+      if (!res.data.running && (prevRunning || taskStarted.value)) {
         processing.value = false
+        taskStarted.value = false
         stopPolling()
 
         if (res.data.error) {
           ElMessage.error(res.data.error)
-        } else {
+        } else if (res.data.processed > 0) {
           ElMessage.success(`处理完成，共处理 ${res.data.processed} 条事件`)
+        } else if (res.data.total === 0) {
+          ElMessage.warning('没有需要处理的事件（所选事件均非安全事件）')
         }
 
-        // 最后刷新一次统计
+        // 最后刷新一次统计和列表
         loadStats()
+        loadEvents()
       }
     }
   } catch (e) {
@@ -469,7 +521,7 @@ function resetFilters() {
   filters.severity = ''
   filters.keyword = ''
   pagination.page = 1
-  loadEvents()
+  // loadEvents 会由 watch 自动触发
 }
 
 function handleSelectionChange(selection: Event[]) {
@@ -505,6 +557,7 @@ async function executeSelectedOperations() {
   }
 
   processing.value = true
+  taskStarted.value = true
   try {
     const eventTable = selectedEvents.value[0].event_table
     const eventIds = selectedEvents.value.map(e => e.id)
@@ -521,7 +574,21 @@ async function executeSelectedOperations() {
     startPolling()
   } catch (e) {
     processing.value = false
+    taskStarted.value = false
     // error handled
+  }
+}
+
+// 停止任务
+async function stopTask() {
+  stopping.value = true
+  try {
+    await ratingApi.stop()
+    ElMessage.success('已发送停止信号')
+  } catch (e) {
+    // error handled
+  } finally {
+    stopping.value = false
   }
 }
 

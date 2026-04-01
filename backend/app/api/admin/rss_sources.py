@@ -14,8 +14,8 @@ from app.schemas.rss_source import (
     RSSSourceCreate, RSSSourceUpdate, RSSSourceResponse, RSSValidateResponse
 )
 from app.schemas.response import ResponseModel
-from app.api.deps import get_current_admin
-from app.tasks.rss_crawler import crawl_source
+from app.api.deps import get_current_admin, not_found_exception
+from app.tasks.rss_crawler import crawl_source, crawl_all_sources
 
 router = APIRouter()
 
@@ -39,7 +39,7 @@ def create_rss_source(
     current_admin: User = Depends(get_current_admin),
     db: Session = Depends(get_db)
 ):
-    """新增RSS数据源"""
+    """创建RSS数据源"""
     source = RSSSource(
         name=source_data.name,
         rss_url=source_data.rss_url,
@@ -69,14 +69,7 @@ def update_rss_source(
     source = db.query(RSSSource).filter(RSSSource.id == source_id).first()
 
     if not source:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "code": 1005,
-                "message": "RSS数据源不存在",
-                "data": None
-            }
-        )
+        raise not_found_exception("RSS数据源不存在")
 
     if update_data.name is not None:
         source.name = update_data.name
@@ -109,14 +102,7 @@ def delete_rss_source(
     source = db.query(RSSSource).filter(RSSSource.id == source_id).first()
 
     if not source:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "code": 1005,
-                "message": "RSS数据源不存在",
-                "data": None
-            }
-        )
+        raise not_found_exception("RSS数据源不存在")
 
     db.delete(source)
     db.commit()
@@ -134,14 +120,7 @@ def validate_rss_source(
     source = db.query(RSSSource).filter(RSSSource.id == source_id).first()
 
     if not source:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "code": 1005,
-                "message": "RSS数据源不存在",
-                "data": None
-            }
-        )
+        raise not_found_exception("RSS数据源不存在")
 
     try:
         feed = feedparser.parse(source.rss_url)
@@ -177,24 +156,46 @@ def validate_rss_source(
         )
 
 
+@router.post("/actions/crawl-all", response_model=ResponseModel)
+def trigger_crawl_all(
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    """手动触发爬取所有活跃的RSS源"""
+    try:
+        result = crawl_all_sources(db)
+
+        total = result["total"]
+        passed = result["passed_filter"]
+        filtered = result["filtered"]
+        sources_count = result["sources_count"]
+        failed_count = result["failed_count"]
+
+        if failed_count > 0:
+            message = f"爬取完成，共处理 {sources_count} 个RSS源（{failed_count} 个失败），新增 {total} 条事件，其中 {passed} 条通过关键词筛选，{filtered} 条被过滤"
+        else:
+            message = f"爬取完成，共处理 {sources_count} 个RSS源，新增 {total} 条事件，其中 {passed} 条通过关键词筛选，{filtered} 条被过滤"
+
+        return ResponseModel(
+            code=0,
+            message=message,
+            data=result
+        )
+    except Exception as e:
+        return ResponseModel(code=3002, message=f"爬取失败: {str(e)}")
+
+
 @router.post("/{source_id}/crawl", response_model=ResponseModel)
 def trigger_crawl(
     source_id: int,
     current_admin: User = Depends(get_current_admin),
     db: Session = Depends(get_db)
 ):
-    """手动触发爬取"""
+    """手动触发爬取单个RSS源"""
     source = db.query(RSSSource).filter(RSSSource.id == source_id).first()
 
     if not source:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "code": 1005,
-                "message": "RSS数据源不存在",
-                "data": None
-            }
-        )
+        raise not_found_exception("RSS数据源不存在")
 
     # 执行爬取逻辑
     try:

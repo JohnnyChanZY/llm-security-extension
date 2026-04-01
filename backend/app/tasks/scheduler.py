@@ -72,13 +72,13 @@ class SchedulerService:
             replace_existing=True
         )
 
-        # LLM自动评级任务 - 每5分钟
-        from .llm_rating import auto_rate_events
+        # LLM自动处理任务 - 每5分钟
+        from .llm_rating import auto_process_events
         self.scheduler.add_job(
-            auto_rate_events,
+            auto_process_events,
             IntervalTrigger(minutes=5),
-            id="llm_rating",
-            name="LLM自动评级",
+            id="llm_process",
+            name="LLM自动处理（筛选+判断+评级/分类）",
             replace_existing=True
         )
 

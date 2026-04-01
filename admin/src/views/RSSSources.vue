@@ -4,10 +4,16 @@
       <template #header>
         <div class="card-header">
           <span>RSS数据源管理</span>
-          <el-button type="primary" @click="showAddDialog">
-            <el-icon><Plus /></el-icon>
-            添加数据源
-          </el-button>
+          <div class="header-buttons">
+            <el-button type="success" @click="crawlAllSources" :loading="crawlingAll">
+              <el-icon><Refresh /></el-icon>
+              一键爬取
+            </el-button>
+            <el-button type="primary" @click="showAddDialog">
+              <el-icon><Plus /></el-icon>
+              添加数据源
+            </el-button>
+          </div>
         </div>
       </template>
 
@@ -92,10 +98,11 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus } from '@element-plus/icons-vue'
+import { Plus, Refresh } from '@element-plus/icons-vue'
 import { rssApi } from '@/api'
 
 const loading = ref(false)
+const crawlingAll = ref(false)
 const sources = ref<any[]>([])
 const dialogVisible = ref(false)
 const editingId = ref<number | null>(null)
@@ -204,6 +211,17 @@ async function crawlSource(row: any) {
   }
 }
 
+async function crawlAllSources() {
+  crawlingAll.value = true
+  try {
+    const result: any = await rssApi.crawlAll()
+    ElMessage.success(result.message || '爬取完成')
+    loadSources()
+  } finally {
+    crawlingAll.value = false
+  }
+}
+
 async function deleteSource(row: any) {
   await ElMessageBox.confirm('确定删除该数据源吗？', '提示', { type: 'warning' })
   try {
@@ -221,5 +239,9 @@ async function deleteSource(row: any) {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+.header-buttons {
+  display: flex;
+  gap: 8px;
 }
 </style>

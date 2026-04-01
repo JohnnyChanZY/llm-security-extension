@@ -135,6 +135,24 @@ def get_events(
     )
 
 
+def _apply_event_filters(query, model, is_processed, is_security_event, severity, keyword):
+    """应用通用的事件过滤条件"""
+    if is_processed is not None:
+        query = query.filter(model.is_processed == is_processed)
+    if is_security_event is not None:
+        query = query.filter(model.is_security_event == is_security_event)
+    if severity:
+        query = query.filter(model.severity == severity)
+    if keyword:
+        query = query.filter(
+            or_(
+                model.title.contains(keyword),
+                model.description.contains(keyword)
+            )
+        )
+    return query
+
+
 def _count_rss_events(
     db: Session,
     is_processed: Optional[bool],
@@ -154,20 +172,7 @@ def _count_rss_events(
             )
         )
 
-    if is_processed is not None:
-        query = query.filter(RSSEvent.is_processed == is_processed)
-    if is_security_event is not None:
-        query = query.filter(RSSEvent.is_security_event == is_security_event)
-    if severity:
-        query = query.filter(RSSEvent.severity == severity)
-    if keyword:
-        query = query.filter(
-            or_(
-                RSSEvent.title.contains(keyword),
-                RSSEvent.description.contains(keyword)
-            )
-        )
-
+    query = _apply_event_filters(query, RSSEvent, is_processed, is_security_event, severity, keyword)
     return query.count()
 
 
@@ -184,20 +189,8 @@ def _count_historical_events(
 
     if source_type:
         query = query.filter(HistoricalEvent.source_type == source_type)
-    if is_processed is not None:
-        query = query.filter(HistoricalEvent.is_processed == is_processed)
-    if is_security_event is not None:
-        query = query.filter(HistoricalEvent.is_security_event == is_security_event)
-    if severity:
-        query = query.filter(HistoricalEvent.severity == severity)
-    if keyword:
-        query = query.filter(
-            or_(
-                HistoricalEvent.title.contains(keyword),
-                HistoricalEvent.description.contains(keyword)
-            )
-        )
 
+    query = _apply_event_filters(query, HistoricalEvent, is_processed, is_security_event, severity, keyword)
     return query.count()
 
 
@@ -224,19 +217,7 @@ def _query_rss_events(
             )
         )
 
-    if is_processed is not None:
-        query = query.filter(RSSEvent.is_processed == is_processed)
-    if is_security_event is not None:
-        query = query.filter(RSSEvent.is_security_event == is_security_event)
-    if severity:
-        query = query.filter(RSSEvent.severity == severity)
-    if keyword:
-        query = query.filter(
-            or_(
-                RSSEvent.title.contains(keyword),
-                RSSEvent.description.contains(keyword)
-            )
-        )
+    query = _apply_event_filters(query, RSSEvent, is_processed, is_security_event, severity, keyword)
 
     total = query.count()
     events = query.order_by(RSSEvent.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
@@ -261,19 +242,8 @@ def _query_historical_events(
 
     if source_type:
         query = query.filter(HistoricalEvent.source_type == source_type)
-    if is_processed is not None:
-        query = query.filter(HistoricalEvent.is_processed == is_processed)
-    if is_security_event is not None:
-        query = query.filter(HistoricalEvent.is_security_event == is_security_event)
-    if severity:
-        query = query.filter(HistoricalEvent.severity == severity)
-    if keyword:
-        query = query.filter(
-            or_(
-                HistoricalEvent.title.contains(keyword),
-                HistoricalEvent.description.contains(keyword)
-            )
-        )
+
+    query = _apply_event_filters(query, HistoricalEvent, is_processed, is_security_event, severity, keyword)
 
     total = query.count()
     events = query.order_by(HistoricalEvent.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()

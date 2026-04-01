@@ -15,6 +15,71 @@ from app.core.llm_logger import get_llm_logger
 
 logger = logging.getLogger(__name__)
 
+
+def safe_parse_json(content: str) -> Tuple[Optional[List], str]:
+    """
+    安全解析LLM返回的JSON内容
+
+    处理以下情况：
+    1. 内容前后有空白字符
+    2. 内容前后有markdown代码块标记
+    3. JSON后面有额外的文本
+    4. 返回的是单个对象而非数组
+
+    Returns:
+        (解析结果或None, 错误信息或空字符串)
+    """
+    if not content:
+        return None, "内容为空"
+
+    # 去除前后空白
+    content = content.strip()
+
+    # 去除可能的markdown代码块标记
+    if content.startswith("```json"):
+        content = content[7:]
+    elif content.startswith("```"):
+        content = content[3:]
+
+    if content.endswith("```"):
+        content = content[:-3]
+
+    content = content.strip()
+
+    # 尝试直接解析
+    try:
+        result = json.loads(content)
+        return result, ""
+    except json.JSONDecodeError:
+        pass
+
+    # 尝试提取JSON数组部分
+    # 找到第一个 [ 和最后一个 ]
+    start_idx = content.find('[')
+    end_idx = content.rfind(']')
+
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        try:
+            json_str = content[start_idx:end_idx + 1]
+            result = json.loads(json_str)
+            return result, ""
+        except json.JSONDecodeError:
+            pass
+
+    # 尝试提取JSON对象部分（可能是单个对象或包装对象）
+    start_idx = content.find('{')
+    end_idx = content.rfind('}')
+
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        try:
+            json_str = content[start_idx:end_idx + 1]
+            result = json.loads(json_str)
+            return result, ""
+        except json.JSONDecodeError:
+            pass
+
+    return None, f"无法解析JSON: {content[:100]}..."
+
 # CVSS 4.0 固定指标值
 CVSS4_FIXED_AV = "N"  # Attack Vector: Network (LLM攻击通常通过网络)
 CVSS4_FIXED_AT = "N"  # Attack Requirements: None
@@ -96,6 +161,11 @@ def calculate_cvss_score(
 # 这里保留常量作为安全上限，防止配置过大
 MAX_BATCH_SIZE_LIMIT = 100  # 硬性上限，防止单次请求过大
 
+# glm-5 等推理模型会使用大量 token 进行思考(reasoning)，
+# 需要设置足够大的 max_tokens 确保有足够空间输出实际内容
+# glm-5 上下文最大 200k，输出最大 128k
+DEFAULT_MAX_TOKENS = 8192
+
 
 def get_batch_size() -> int:
     """获取配置的批次大小"""
@@ -135,7 +205,7 @@ class LLMService:
             结果列表: [{"id": 1, "is_security_event": true, "reason": "..."}, ...]
         """
         if not self.is_available():
-            return [{"id": e["id"], "is_security_event": True, "reason": "LLM服务不可用"} for e in events]
+            return [{"id": e["id"], "is_security_event": False, "reason": "LLM服务不可用"} for e in events]
 
         if not events:
             return []
@@ -180,7 +250,8 @@ class LLMService:
                 model=self.model,
                 messages=messages,
                 response_format={"type": "json_object"},
-                temperature=0
+                temperature=0,
+                max_tokens=DEFAULT_MAX_TOKENS
             )
 
             content = response.choices[0].message.content
@@ -195,7 +266,11 @@ class LLMService:
                 duration_ms=duration_ms
             )
 
-            result = json.loads(content)
+            # 使用安全解析
+            result, parse_error = safe_parse_json(content)
+            if result is None:
+                logger.error(f"LLM 返回JSON解析失败: {parse_error}, 原始内容: {content[:200]}")
+                return self._default_security_result(events, f"JSON解析失败: {parse_error}")
 
             # 处理可能的包装格式
             if isinstance(result, dict) and "results" in result:
@@ -232,8 +307,12 @@ class LLMService:
             return self._default_security_result(events, f"判断失败")
 
     def _default_security_result(self, events: List[Dict[str, Any]], reason: str) -> List[Dict[str, Any]]:
-        """生成默认的安全检查结果"""
-        return [{"id": e["id"], "is_security_event": True, "reason": reason} for e in events]
+        """生成默认的安全检查结果
+
+        当LLM调用失败时，默认标记为非安全事件(is_security_event=False)，
+        避免将非安全事件误判为安全事件推送给用户。
+        """
+        return [{"id": e["id"], "is_security_event": False, "reason": reason} for e in events]
 
     def batch_rate_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -330,7 +409,8 @@ class LLMService:
                 model=self.model,
                 messages=messages,
                 response_format={"type": "json_object"},
-                temperature=0
+                temperature=0,
+                max_tokens=DEFAULT_MAX_TOKENS
             )
 
             content = response.choices[0].message.content
@@ -345,7 +425,11 @@ class LLMService:
                 duration_ms=duration_ms
             )
 
-            result = json.loads(content)
+            # 使用安全解析
+            result, parse_error = safe_parse_json(content)
+            if result is None:
+                logger.error(f"LLM 返回JSON解析失败: {parse_error}, 原始内容: {content[:200]}")
+                return self._default_rating_result(events)
 
             # 处理可能的包装格式
             if isinstance(result, dict) and "results" in result:
@@ -489,7 +573,8 @@ class LLMService:
                 model=self.model,
                 messages=messages,
                 response_format={"type": "json_object"},
-                temperature=0
+                temperature=0,
+                max_tokens=DEFAULT_MAX_TOKENS
             )
 
             content = response.choices[0].message.content
@@ -504,7 +589,11 @@ class LLMService:
                 duration_ms=duration_ms
             )
 
-            result = json.loads(content)
+            # 使用安全解析
+            result, parse_error = safe_parse_json(content)
+            if result is None:
+                logger.error(f"LLM 返回JSON解析失败: {parse_error}, 原始内容: {content[:200]}")
+                return self._default_classify_result(events)
 
             # 处理可能的包装格式
             if isinstance(result, dict) and "results" in result:
@@ -621,7 +710,8 @@ class LLMService:
                 model=self.model,
                 messages=messages,
                 response_format={"type": "json_object"},
-                temperature=0
+                temperature=0,
+                max_tokens=DEFAULT_MAX_TOKENS
             )
 
             content = response.choices[0].message.content
@@ -636,13 +726,18 @@ class LLMService:
                 duration_ms=duration_ms
             )
 
-            result = json.loads(content)
+            # 使用安全解析
+            result, parse_error = safe_parse_json(content)
+            if result is None:
+                logger.error(f"LLM 返回JSON解析失败: {parse_error}, 原始内容: {content[:200] if content else ''}")
+                return self._default_rate_classify_result(events)
 
             if isinstance(result, dict) and "results" in result:
                 result = result["results"]
             elif isinstance(result, list):
                 pass
             else:
+                logger.error(f"LLM 返回格式异常: {content[:200] if content else ''}")
                 return self._default_rate_classify_result(events)
 
             # 处理结果：计算CVSS分数并映射severity

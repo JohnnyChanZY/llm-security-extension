@@ -69,8 +69,8 @@ def get_llm_config(
     return ResponseModel(
         code=0,
         data=LLMConfigResponse(
-            llm_classify_enabled=configs.get("llm_classify_enabled", "false").lower() == "true",
             llm_rating_enabled=configs.get("llm_rating_enabled", "false").lower() == "true",
+            llm_classify_enabled=configs.get("llm_classify_enabled", "false").lower() == "true",
             llm_batch_size=int(configs.get("llm_batch_size", "30")),
             llm_max_concurrent_batches=int(configs.get("llm_max_concurrent_batches", "3")),
             llm_request_interval=float(configs.get("llm_request_interval", "2")),

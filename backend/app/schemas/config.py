@@ -29,11 +29,11 @@ class ConfigResponse(ConfigBase):
 
 class LLMConfigResponse(BaseModel):
     """LLM配置响应"""
-    llm_classify_enabled: bool
     llm_rating_enabled: bool
+    llm_classify_enabled: bool
     llm_batch_size: int
-    llm_max_concurrent_batches: int = 3  # 并行处理最大批次数
+    llm_max_concurrent_batches: int = 3  # 最大并发批次
     llm_request_interval: float = 2.0  # 请求间隔时间（秒）
     max_batch_size: int = 100  # 批量处理最大上限
-    max_concurrent_batches: int = 10  # 并行批次最大上限
+    max_concurrent_batches: int = 10  # 最大并发批次上限
     max_request_interval: float = 60.0  # 请求间隔最大上限

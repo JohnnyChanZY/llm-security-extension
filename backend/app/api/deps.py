@@ -133,3 +133,15 @@ def get_optional_user(
 
     user = db.query(User).filter(User.id == int(user_id)).first()
     return user if user and user.is_active else None
+
+
+def not_found_exception(message: str) -> HTTPException:
+    """生成标准的404异常"""
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={
+            "code": 1005,
+            "message": message,
+            "data": None
+        }
+    )
