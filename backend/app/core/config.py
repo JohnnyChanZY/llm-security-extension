@@ -1,0 +1,63 @@
+"""
+配置管理模块
+负责加载和管理应用程序配置
+"""
+from pydantic_settings import BaseSettings
+from typing import Optional
+from functools import lru_cache
+
+
+class Settings(BaseSettings):
+    """应用程序配置类"""
+
+    # 应用配置
+    app_name: str = "LLM Security Event Push System"
+    app_version: str = "3.0.0"
+    debug: bool = True
+
+    # 数据库配置
+    database_url: str = "mysql+pymysql://root:Johnny2004@localhost:3306/llm_security"
+
+    # NVD API配置
+    nvd_api_key: str = "84b20dc6-1526-42ee-be8a-0ff22324fed0"
+
+    # AIID API配置
+    aiid_api_key: str = "user:gh.5d5d398d-de57-4892-af41-3d574595e4a3:pa7CieIaoqHD_lIu6Klghw"
+
+    # LLM API配置 (通用配置，支持腾讯云等)
+    llm_api_key: str = ""
+    llm_base_url: str = "https://api.lkeap.cloud.tencent.com/coding/v3"
+    llm_model: str = "glm-5"
+
+    # JWT配置
+    jwt_secret_key: str = "your-secret-key-change-in-production"
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 30
+    refresh_token_expire_days: int = 7
+
+    # 管理员配置
+    admin_email: str = "admin"
+    admin_password: str = "password"
+
+    # LLM 日志配置
+    llm_log_enabled: bool = False
+    llm_log_dir: str = "logs/llm"
+
+    # LLM 批处理配置
+    llm_batch_size: int = 30  # 单次 LLM 请求最多处理的事件数
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = False
+        extra = "ignore"
+
+
+@lru_cache()
+def get_settings() -> Settings:
+    """获取配置单例"""
+    return Settings()
+
+
+# 导出配置实例
+settings = get_settings()

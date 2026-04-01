@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "LLM安全事件推送",
+  "version": "1.0.0",
+  "description": "LLM安全事件推送浏览器插件 - 及时了解LLM安全领域的最新动态",
+  "icons": {
+    "16": "src/assets/icon16.png",
+    "48": "src/assets/icon48.png",
+    "128": "src/assets/icon128.png"
+  },
+  "action": {
+    "default_popup": "src/popup/index.html",
+    "default_icon": {
+      "16": "src/assets/icon16.png",
+      "48": "src/assets/icon48.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "src/sidepanel/index.html"
+  },
+  "background": {
+    "service_worker": "src/background/index.ts",
+    "type": "module"
+  },
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "notifications",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "http://localhost:5173/*",
+    "https://*/*"
+  ]
+}
