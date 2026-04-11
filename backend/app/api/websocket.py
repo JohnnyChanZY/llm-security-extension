@@ -74,9 +74,13 @@ async def websocket_endpoint(
     token: str = Query(...)
 ):
     """WebSocket端点"""
+    # 先接受连接（必须在接受后才能关闭）
+    await websocket.accept()
+
     # 验证Token
     user_id = verify_token(token, token_type="access")
     if not user_id:
+        logger.warning(f"WebSocket认证失败: token无效或已过期")
         await websocket.close(code=4001, reason="认证失败")
         return
 
@@ -90,8 +94,9 @@ async def websocket_endpoint(
     finally:
         db.close()
 
-    # 接受连接
-    await manager.connect(websocket, int(user_id))
+    # 注册连接到管理器
+    manager.active_connections[int(user_id)] = websocket
+    logger.info(f"用户 {user_id} WebSocket连接成功")
 
     try:
         while True:

@@ -10,6 +10,7 @@ from app.core.database import SessionLocal
 from app.models.rss_source import RSSSource
 from app.models.rss_event import RSSEvent
 from app.services.keyword_filter import filter_rss_events_batch, is_keyword_filter_enabled, get_filter_keywords
+from app.services.html_cleaner import clean_html
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,7 @@ def crawl_source(source: RSSSource, db: Session) -> dict:
             # 创建新事件
             event = RSSEvent(
                 title=entry.get('title', ''),
-                description=entry.get('summary', ''),
+                description=clean_html(entry.get('summary', '')),
                 rss_source_id=source.id,
                 source_name=source.name,
                 original_url=url,

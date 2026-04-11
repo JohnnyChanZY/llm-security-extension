@@ -3,7 +3,7 @@
 """
 from typing import Optional, List
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from enum import Enum
 
 
@@ -34,6 +34,7 @@ class EventBase(BaseModel):
 
 class EventFilter(BaseModel):
     """事件筛选参数"""
+    model_config = ConfigDict(protected_namespaces=())
     page: int = 1
     page_size: int = 20
     category: Optional[str] = None

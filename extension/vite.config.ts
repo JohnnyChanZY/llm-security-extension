@@ -15,11 +15,15 @@ export default defineConfig({
     }
   },
   server: {
-    host: true,
+    host: 'localhost',
     port: 5173,
     strictPort: true,
-    hmr: {
-      port: 5173
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: undefined
+      }
     }
   }
 })

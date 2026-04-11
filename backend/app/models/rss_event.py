@@ -3,6 +3,7 @@ RSS实时安全事件数据模型
 存储RSS获取的实时数据，用于推送
 """
 from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, Enum, Float
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.sql import func
 from ..core.database import Base
 from .historical_event import SeverityLevel, SeveritySource
@@ -26,7 +27,7 @@ class RSSEvent(Base):
     cvss_score = Column(Float, comment="CVSS 4.0基础分数")
     cvss_vector = Column(String(200), comment="CVSS 4.0向量字符串")
     affected_versions = Column(String(500), comment="影响版本")
-    raw_content = Column(Text, comment="原始内容（用于LLM分析）")
+    raw_content = Column(LONGTEXT, comment="原始内容（用于LLM分析）")
     is_processed = Column(Boolean, default=False, comment="是否已处理（分类、评级）")
     is_pushed = Column(Boolean, default=False, comment="是否已推送")
     is_security_event = Column(Boolean, default=None, comment="是否为安全事件(None=未判断)")

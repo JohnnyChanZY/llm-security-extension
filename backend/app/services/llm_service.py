@@ -2,13 +2,24 @@
 LLM 服务 - 统一的评级与分类逻辑
 支持批量处理以节省 token
 使用 CVSS 4.0 标准进行安全等级评定
+
+性能优化说明：
+  1. 固定 max_tokens：使用 10k 固定限制，简化配置
+  2. 分组并发：事件超出 batch_size 时自动拆分为多批，按 max_concurrent_batches 分组并发
+     - 例如：9批次、并发数3 → 分3组：[1,2,3并发] → 等待 → [4,5,6并发] → 等待 → [7,8,9并发]
+  3. 异步客户端：新增 AsyncOpenAI，适配 FastAPI 等异步框架，不再阻塞事件循环
+  4. 提取公共调用逻辑：_call_llm_sync / _call_llm_async 消除大量重复代码
+  5. 动态配置：并发数和等待间隔从数据库读取，支持管理员界面实时调整
 """
+import asyncio
 import logging
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Any, Tuple
-from openai import OpenAI, APIError, APIConnectionError, RateLimitError, AuthenticationError, BadRequestError
+
+from openai import OpenAI, AsyncOpenAI
 
 from app.core.config import settings
 from app.core.llm_logger import get_llm_logger
@@ -157,19 +168,77 @@ def calculate_cvss_score(
         logger.error(f"CVSS分数计算失败: {e}")
         return 5.0, ""  # 返回中等分数作为默认值
 
+# ──────────────────────────────────────────────
+# 并发配置
+# ──────────────────────────────────────────────
 # 批量处理配置（已移至 config.py，通过 settings.llm_batch_size 配置）
 # 这里保留常量作为安全上限，防止配置过大
 MAX_BATCH_SIZE_LIMIT = 100  # 硬性上限，防止单次请求过大
+MAX_CONCURRENT_BATCHES_LIMIT = 10  # 最大并发批次上限
+MAX_REQUEST_INTERVAL_LIMIT = 60.0  # 最大请求间隔上限（秒）
 
 # glm-5 等推理模型会使用大量 token 进行思考(reasoning)，
 # 需要设置足够大的 max_tokens 确保有足够空间输出实际内容
 # glm-5 上下文最大 200k，输出最大 128k
-DEFAULT_MAX_TOKENS = 8192
+# 固定使用 10k token 限制
+DEFAULT_MAX_TOKENS = 10000
 
 
 def get_batch_size() -> int:
-    """获取配置的批次大小"""
-    return min(settings.llm_batch_size, MAX_BATCH_SIZE_LIMIT)
+    """从数据库获取批次大小配置"""
+    from app.core.database import SessionLocal
+    from app.models.system_config import SystemConfig
+
+    db = SessionLocal()
+    try:
+        config = db.query(SystemConfig).filter(
+            SystemConfig.config_key == "llm_batch_size"
+        ).first()
+        if config and config.config_value:
+            return min(int(config.config_value), MAX_BATCH_SIZE_LIMIT)
+    except Exception as e:
+        logger.debug(f"获取批次大小配置失败，使用默认值: {e}")
+    finally:
+        db.close()
+    return settings.llm_batch_size  # 默认值
+
+
+def get_max_concurrent_batches() -> int:
+    """从数据库获取最大并发批次配置"""
+    from app.core.database import SessionLocal
+    from app.models.system_config import SystemConfig
+
+    db = SessionLocal()
+    try:
+        config = db.query(SystemConfig).filter(
+            SystemConfig.config_key == "llm_max_concurrent_batches"
+        ).first()
+        if config and config.config_value:
+            return min(int(config.config_value), MAX_CONCURRENT_BATCHES_LIMIT)
+    except Exception as e:
+        logger.debug(f"获取并发配置失败，使用默认值: {e}")
+    finally:
+        db.close()
+    return 3  # 默认值
+
+
+def get_request_interval() -> float:
+    """从数据库获取请求间隔配置"""
+    from app.core.database import SessionLocal
+    from app.models.system_config import SystemConfig
+
+    db = SessionLocal()
+    try:
+        config = db.query(SystemConfig).filter(
+            SystemConfig.config_key == "llm_request_interval"
+        ).first()
+        if config and config.config_value:
+            return min(float(config.config_value), MAX_REQUEST_INTERVAL_LIMIT)
+    except Exception as e:
+        logger.debug(f"获取请求间隔配置失败，使用默认值: {e}")
+    finally:
+        db.close()
+    return 2.0  # 默认值
 
 
 class LLMService:
@@ -177,16 +246,16 @@ class LLMService:
 
     def __init__(self):
         self.client: Optional[OpenAI] = None
+        self.async_client: Optional[AsyncOpenAI] = None
         self.model = settings.llm_model
         self._init_client()
 
     def _init_client(self):
-        """初始化 OpenAI 客户端"""
+        """初始化 OpenAI 客户端（同步和异步）"""
         if settings.llm_api_key:
-            self.client = OpenAI(
-                api_key=settings.llm_api_key,
-                base_url=settings.llm_base_url
-            )
+            kwargs = dict(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
+            self.client = OpenAI(**kwargs)
+            self.async_client = AsyncOpenAI(**kwargs)
         else:
             logger.warning("未配置 LLM API 密钥")
 
@@ -194,117 +263,303 @@ class LLMService:
         """检查 LLM 服务是否可用"""
         return self.client is not None
 
-    def batch_check_security(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        批量判断是否为安全事件
+    # ──────────────────────────────────────────
+    # 内部公共调用方法
+    # ──────────────────────────────────────────
 
-        Args:
-            events: 事件列表，每个事件包含 id, title, description
-
-        Returns:
-            结果列表: [{"id": 1, "is_security_event": true, "reason": "..."}, ...]
-        """
-        if not self.is_available():
-            return [{"id": e["id"], "is_security_event": False, "reason": "LLM服务不可用"} for e in events]
-
-        if not events:
-            return []
-
-        # 构建批量提示
-        events_text = "\n\n".join([
-            f"[事件{e['id']}]\n标题：{e['title']}\n描述：{(e.get('description') or e.get('raw_content') or '')[:300]}"
-            for e in events
-        ])
-
-        system_prompt = """你是一个AI安全事件识别专家。请判断以下事件是否为AI/LLM相关的安全事件。
-
-## 安全事件定义
-
-✅ 包括：漏洞披露、CVE公告、攻击手法（提示注入/越狱/对抗攻击）、隐私泄露、模型安全风险、安全机制绕过
-
-❌ 不包括：产品发布、功能更新、教程文章、行业动态、商业推广、能力评测
-
-## 输出要求
-以JSON数组输出，每个对象包含：
-- id: 事件ID
-- is_security_event: 布尔值
-- reason: 理由（不超过15字）
-
-## 输出示例
-[
-  {"id": 1, "is_security_event": true, "reason": "CVE漏洞"},
-  {"id": 2, "is_security_event": false, "reason": "产品更新"}
-]"""
-
-        user_prompt = f"请判断以下{len(events)}个事件是否为AI/LLM安全事件：\n\n{events_text}"
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-        llm_logger = get_llm_logger()
-        start_time = time.time()
-
+    def _call_llm_sync(self, messages: List[Dict], max_tokens: int) -> Tuple[str, float]:
+        """同步调用 LLM，返回 (content, duration_ms)"""
+        start = time.time()
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 response_format={"type": "json_object"},
                 temperature=0,
-                max_tokens=DEFAULT_MAX_TOKENS
+                max_tokens=max_tokens,
             )
-
             content = response.choices[0].message.content
-            duration_ms = (time.time() - start_time) * 1000
+            duration_ms = (time.time() - start) * 1000
 
-            # 记录成功调用
-            llm_logger.log_security_check(
+            # 检查空响应
+            if not content or not content.strip():
+                logger.warning(
+                    f"LLM 返回空内容，max_tokens={max_tokens}, "
+                    f"duration={duration_ms:.0f}ms, model={self.model}"
+                )
+                # 对于推理模型，可能是 max_tokens 不够
+                # 尝试不带 json_object 格式限制重新请求
+                logger.info("尝试不带 response_format 限制重新请求...")
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0,
+                    max_tokens=max_tokens * 2,  # 给更多空间
+                )
+                content = response.choices[0].message.content
+                duration_ms = (time.time() - start) * 1000
+
+            return content or "", duration_ms
+        except Exception as e:
+            logger.error(f"LLM 调用失败: {e}")
+            raise
+
+    async def _call_llm_async(self, messages: List[Dict], max_tokens: int) -> Tuple[str, float]:
+        """异步调用 LLM（适用于 FastAPI 等 async 框架），返回 (content, duration_ms)"""
+        start = time.time()
+        try:
+            response = await self.async_client.chat.completions.create(
                 model=self.model,
-                events=events,
                 messages=messages,
-                response=content,
-                duration_ms=duration_ms
+                response_format={"type": "json_object"},
+                temperature=0,
+                max_tokens=max_tokens,
             )
+            content = response.choices[0].message.content
+            duration_ms = (time.time() - start) * 1000
 
-            # 使用安全解析
-            result, parse_error = safe_parse_json(content)
+            # 检查空响应
+            if not content or not content.strip():
+                logger.warning(
+                    f"[async] LLM 返回空内容，max_tokens={max_tokens}, "
+                    f"duration={duration_ms:.0f}ms, model={self.model}"
+                )
+                logger.info("[async] 尝试不带 response_format 限制重新请求...")
+                response = await self.async_client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0,
+                    max_tokens=max_tokens * 2,
+                )
+                content = response.choices[0].message.content
+                duration_ms = (time.time() - start) * 1000
+
+            return content or "", duration_ms
+        except Exception as e:
+            logger.error(f"[async] LLM 调用失败: {e}")
+            raise
+
+    @staticmethod
+    def _chunk_events(events: List[Dict]) -> List[List[Dict]]:
+        """将事件列表按 batch_size 切分"""
+        size = get_batch_size()
+        return [events[i:i + size] for i in range(0, len(events), size)]
+
+    def _run_concurrent(self, fn, chunks: List[List[Dict]],
+                        max_concurrent: int = None,
+                        request_interval: float = None) -> List[Dict]:
+        """
+        分组并发执行多个批次，组间有等待时间
+
+        Args:
+            fn: 处理单批次的函数
+            chunks: 批次列表
+            max_concurrent: 最大并发数（None则从数据库读取）
+            request_interval: 组间等待时间秒数（None则从数据库读取）
+
+        Returns:
+            合并后的结果列表
+        """
+        n_chunks = len(chunks)
+        if n_chunks == 1:
+            logger.debug(f"[并发] 单批次处理，事件数: {len(chunks[0])}，跳过并发")
+            result = fn(chunks[0])
+            # 回调通知进度
+            if _progress_callback:
+                try:
+                    _progress_callback(batch_completed=1, total_batches=1, events_processed=len(result))
+                except Exception as e:
+                    logger.warning(f"进度回调失败: {e}")
+            return result
+
+        # 获取配置
+        if max_concurrent is None:
+            max_concurrent = get_max_concurrent_batches()
+        if request_interval is None:
+            request_interval = get_request_interval()
+
+        results: List[Dict] = []
+        start_time = time.time()
+        batches_completed = 0
+
+        # 分组：每 max_concurrent 个批次为一组
+        groups = [chunks[i:i + max_concurrent] for i in range(0, n_chunks, max_concurrent)]
+        logger.info(f"[并发] 共 {n_chunks} 批次，分 {len(groups)} 组，每组最多 {max_concurrent} 并发")
+
+        for group_idx, group in enumerate(groups):
+            group_start = time.time()
+
+            # 组内并发执行
+            with ThreadPoolExecutor(max_workers=len(group)) as executor:
+                futures = [executor.submit(fn, chunk) for chunk in group]
+                for future in as_completed(futures):
+                    try:
+                        batch_result = future.result()
+                        results.extend(batch_result)
+                        batches_completed += 1
+                        # 每完成一个批次就回调通知进度
+                        if _progress_callback:
+                            try:
+                                _progress_callback(
+                                    batch_completed=batches_completed,
+                                    total_batches=n_chunks,
+                                    events_processed=len(results)
+                                )
+                            except Exception as e:
+                                logger.warning(f"进度回调失败: {e}")
+                    except Exception as e:
+                        logger.error(f"并发批次处理失败: {e}")
+                        batches_completed += 1  # 即使失败也计数
+
+            group_duration = time.time() - group_start
+            logger.info(f"[并发] 第 {group_idx + 1}/{len(groups)} 组完成，耗时 {group_duration:.1f}s")
+
+            # 组间等待（最后一组不等待）
+            if group_idx < len(groups) - 1 and request_interval > 0:
+                logger.debug(f"[并发] 等待 {request_interval}s 后处理下一组")
+                time.sleep(request_interval)
+
+        total_duration = time.time() - start_time
+        logger.info(f"[并发] 全部完成，总结果数: {len(results)}，总耗时: {total_duration:.1f}s")
+        return results
+
+    async def _run_concurrent_async(self, coro_fn, chunks: List[List[Dict]],
+                                    max_concurrent: int = None,
+                                    request_interval: float = None) -> List[Dict]:
+        """
+        异步分组并发执行多个批次，组间有等待时间
+
+        Args:
+            coro_fn: 处理单批次的异步函数
+            chunks: 批次列表
+            max_concurrent: 最大并发数（None则从数据库读取）
+            request_interval: 组间等待时间秒数（None则从数据库读取）
+
+        Returns:
+            合并后的结果列表
+        """
+        n_chunks = len(chunks)
+        if n_chunks == 1:
+            return await coro_fn(chunks[0])
+
+        # 获取配置
+        if max_concurrent is None:
+            max_concurrent = get_max_concurrent_batches()
+        if request_interval is None:
+            request_interval = get_request_interval()
+
+        results: List[Dict] = []
+        start_time = time.time()
+
+        # 分组：每 max_concurrent 个批次为一组
+        groups = [chunks[i:i + max_concurrent] for i in range(0, n_chunks, max_concurrent)]
+        logger.info(f"[并发] 共 {n_chunks} 批次，分 {len(groups)} 组，每组最多 {max_concurrent} 并发")
+
+        for group_idx, group in enumerate(groups):
+            group_start = time.time()
+
+            # 组内并发执行
+            tasks = [coro_fn(chunk) for chunk in group]
+            group_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for r in group_results:
+                if isinstance(r, Exception):
+                    logger.error(f"异步批次处理失败: {r}")
+                else:
+                    results.extend(r)
+
+            group_duration = time.time() - group_start
+            logger.info(f"[并发] 第 {group_idx + 1}/{len(groups)} 组完成，耗时 {group_duration:.1f}s")
+
+            # 组间等待（最后一组不等待）
+            if group_idx < len(groups) - 1 and request_interval > 0:
+                logger.debug(f"[并发] 等待 {request_interval}s 后处理下一组")
+                await asyncio.sleep(request_interval)
+
+        total_duration = time.time() - start_time
+        logger.info(f"[并发] 全部完成，总结果数: {len(results)}，总耗时: {total_duration:.1f}s")
+        return results
+
+    @staticmethod
+    def _normalize_result_ids(result: List[Dict]) -> None:
+        """原地修复 LLM 可能返回 '事件9' 形式的 ID"""
+        for item in result:
+            if "id" in item and isinstance(item["id"], str):
+                m = re.search(r'\d+', item["id"])
+                if m:
+                    item["id"] = int(m.group())
+
+    def _unwrap_result(self, content: str, default_fn) -> Optional[List[Dict]]:
+        """解析并解包 LLM 返回的 JSON，失败时返回 None"""
+        parsed, err = safe_parse_json(content)
+        if parsed is None:
+            logger.error(f"JSON解析失败: {err}, 原始内容: {content[:200]}")
+            return None
+        if isinstance(parsed, dict) and "results" in parsed:
+            parsed = parsed["results"]
+        if not isinstance(parsed, list):
+            logger.error(f"返回格式异常: {content[:200]}")
+            return None
+        return parsed
+
+    @staticmethod
+    def _build_events_text(events: List[Dict], max_desc: int = 300) -> str:
+        """构建事件文本（英文格式）"""
+        return "\n\n".join(
+            f"[Event {e['id']}]\nTitle: {e['title']}\nDescription: {(e.get('description') or e.get('raw_content') or '')[:max_desc]}"
+            for e in events
+        )
+
+    # ──────────────────────────────────────────
+    # 批量安全检查（同步）
+    # ──────────────────────────────────────────
+
+    def batch_check_security(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """批量判断是否为 AI/LLM 安全事件"""
+        if not self.is_available():
+            return self._default_security_result(events, "LLM服务不可用")
+        if not events:
+            return []
+        chunks = self._chunk_events(events)
+        return self._run_concurrent(self._check_security_chunk, chunks)
+
+    def _check_security_chunk(self, events: List[Dict]) -> List[Dict]:
+        system_prompt = """You are an AI security event identification expert. Determine whether each event is an AI/LLM-related security event.
+
+✅ INCLUDE: Vulnerability disclosures, CVE announcements, attack techniques (prompt injection/jailbreaking/adversarial attacks), privacy leaks, model security risks, security mechanism bypasses
+❌ EXCLUDE: Product launches, feature updates, tutorial articles, industry news, commercial promotions, capability evaluations
+
+Output as a JSON array. Each item must contain:
+- id: integer (event ID)
+- is_security_event: boolean
+- reason: string (≤20 chars, brief explanation)
+
+Example: [{"id":1,"is_security_event":true,"reason":"CVE vulnerability"},{"id":2,"is_security_event":false,"reason":"Product update"}]"""
+
+        events_text = self._build_events_text(events, max_desc=300)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Determine whether the following {len(events)} events are AI/LLM security events:\n\n{events_text}"},
+        ]
+        llm_logger = get_llm_logger()
+
+        try:
+            content, duration_ms = self._call_llm_sync(messages, DEFAULT_MAX_TOKENS)
+            llm_logger.log_security_check(model=self.model, events=events,
+                                          messages=messages, response=content,
+                                          duration_ms=duration_ms)
+            result = self._unwrap_result(content, None)
             if result is None:
-                logger.error(f"LLM 返回JSON解析失败: {parse_error}, 原始内容: {content[:200]}")
-                return self._default_security_result(events, f"JSON解析失败: {parse_error}")
-
-            # 处理可能的包装格式
-            if isinstance(result, dict) and "results" in result:
-                result = result["results"]
-            elif isinstance(result, list):
-                pass
-            else:
-                logger.error(f"LLM 返回格式异常: {content[:200]}")
-                return self._default_security_result(events, "返回格式异常")
-
-            # 修复 ID 格式：LLM 可能返回 "事件9" 这样的字符串，需要提取数字
-            for item in result:
-                if "id" in item and isinstance(item["id"], str):
-                    match = re.search(r'\d+', str(item["id"]))
-                    if match:
-                        item["id"] = int(match.group())
-
+                return self._default_security_result(events, "JSON解析失败")
+            self._normalize_result_ids(result)
             return result
 
         except Exception as e:
-            duration_ms = (time.time() - start_time) * 1000
-            error_msg = str(e)
             logger.error(f"LLM 安全事件判断失败: {e}")
-
-            # 记录失败调用
-            llm_logger.log_security_check(
-                model=self.model,
-                events=events,
-                messages=messages,
-                error=error_msg,
-                duration_ms=duration_ms
-            )
-
-            return self._default_security_result(events, f"判断失败")
+            llm_logger.log_security_check(model=self.model, events=events,
+                                          messages=messages, error=str(e),
+                                          duration_ms=0)
+            return self._default_security_result(events, "判断失败")
 
     def _default_security_result(self, events: List[Dict[str, Any]], reason: str) -> List[Dict[str, Any]]:
         """生成默认的安全检查结果
@@ -314,196 +569,85 @@ class LLMService:
         """
         return [{"id": e["id"], "is_security_event": False, "reason": reason} for e in events]
 
+    # ──────────────────────────────────────────
+    # 批量评级（同步）
+    # ──────────────────────────────────────────
+
     def batch_rate_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        批量评级事件 - 使用CVSS 4.0标准
-
-        Args:
-            events: 事件列表，每个事件包含 id, title, description
-
-        Returns:
-            结果列表: [{"id": 1, "severity": "high", "cvss_score": 8.7, "cvss_vector": "CVSS:4.0/..."}, ...]
-        """
+        """批量评级事件，使用 CVSS 4.0 标准"""
         if not self.is_available():
             return self._default_rating_result(events)
-
         if not events:
             return []
+        chunks = self._chunk_events(events)
+        return self._run_concurrent(self._rate_events_chunk, chunks)
 
-        # 构建批量提示
-        events_text = "\n\n".join([
-            f"[事件{e['id']}]\n标题：{e['title']}\n描述：{(e.get('description') or e.get('raw_content') or '')[:800]}"
-            for e in events
-        ])
+    def _rate_events_chunk(self, events: List[Dict]) -> List[Dict]:
+        system_prompt = """你是AI安全风险评估专家，使用CVSS 4.0评估LLM安全事件严重程度。
 
-        system_prompt = """你是一个AI安全风险评估专家，使用CVSS 4.0标准评估LLM安全事件的严重程度。
+## CVSS 4.0 指标
+- AC(攻击复杂度): L=无需绕过安全机制 / H=需要绕过
+- PR(所需权限): N=无需 / L=普通用户 / H=管理员
+- UI(用户交互): N=无需 / P=被动 / A=主动
+- VC(机密性): N=无泄露 / L=部分泄露 / H=全部/关键泄露
+- VI(完整性): N=无篡改 / L=部分篡改 / H=完全控制
+- VA(可用性): N=无中断 / L=性能下降 / H=完全不可用
 
-## 评估指标说明
+以JSON数组输出，每项包含 id、ac、pr、ui、vc、vi、va。
+示例：[{"id":1,"ac":"L","pr":"N","ui":"N","vc":"H","vi":"H","va":"N"}]"""
 
-### 1. 攻击复杂度 (AC) - 攻击是否需要绕过安全机制？
-- L (Low): 攻击者无需采取任何额外措施，可重复成功攻击
-- H (High): 需要绕过安全增强技术（如ASLR、DEP）或获取目标特定密钥
-
-### 2. 所需权限 (PR) - 攻击前需要什么权限？
-- N (None): 无需任何权限，未认证即可攻击
-- L (Low): 需要普通用户权限，只能访问非敏感资源
-- H (High): 需要管理员/高级权限
-
-### 3. 用户交互 (UI) - 是否需要用户参与？
-- N (None): 不需要任何用户交互
-- P (Passive): 用户被动参与（如浏览被篡改的网页）
-- A (Active): 用户需要主动执行特定操作（如打开文件、点击链接）
-
-### 4. 机密性影响 (VC) - 信息泄露程度？
-- N (None): 无信息泄露
-- L (Low): 部分非敏感信息泄露
-- H (High): 全部或关键敏感信息泄露（如密钥、密码、训练数据）
-
-### 5. 完整性影响 (VI) - 数据篡改程度？
-- N (None): 无数据被修改
-- L (Low): 部分数据可被修改，但不直接影响系统安全
-- H (High): 任意数据可被修改，或修改会直接严重影响系统
-
-### 6. 可用性影响 (VA) - 服务中断程度？
-- N (None): 无服务中断
-- L (Low): 性能下降或间歇性中断
-- H (High): 完全不可用或持续性拒绝服务
-
-## LLM安全事件评估指南
-
-| 场景 | AC | PR | UI | VC | VI | VA |
-|------|----|----|----|----|----|----|
-| 公开API提示注入 | L | N | N | L-H | L-H | N |
-| 越狱攻击获取训练数据 | L-H | N | N | H | N | N |
-| 对抗样本攻击 | H | N | N | N | L-H | N |
-| 间接提示注入(需用户触发) | L | N | P-A | L-H | L-H | N |
-| LLM服务DoS攻击 | L | N | N | N | N | H |
-
-## 输出要求
-以JSON数组输出，每个对象包含：
-- id: 事件ID
-- ac: 攻击复杂度 (L/H)
-- pr: 所需权限 (N/L/H)
-- ui: 用户交互 (N/P/A)
-- vc: 机密性影响 (N/L/H)
-- vi: 完整性影响 (N/L/H)
-- va: 可用性影响 (N/L/H)
-
-## 输出示例
-[
-  {"id": 1, "ac": "L", "pr": "N", "ui": "N", "vc": "H", "vi": "H", "va": "N"},
-  {"id": 2, "ac": "L", "pr": "N", "ui": "A", "vc": "L", "vi": "N", "va": "N"}
-]"""
-
-        user_prompt = f"请根据CVSS 4.0标准评估以下{len(events)}个LLM安全事件：\n\n{events_text}"
-
+        events_text = self._build_events_text(events, max_desc=800)
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": f"请评估以下{len(events)}个LLM安全事件：\n\n{events_text}"},
         ]
         llm_logger = get_llm_logger()
-        start_time = time.time()
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0,
-                max_tokens=DEFAULT_MAX_TOKENS
-            )
-
-            content = response.choices[0].message.content
-            duration_ms = (time.time() - start_time) * 1000
-
-            # 记录成功调用
-            llm_logger.log_rating(
-                model=self.model,
-                events=events,
-                messages=messages,
-                response=content,
-                duration_ms=duration_ms
-            )
-
-            # 使用安全解析
-            result, parse_error = safe_parse_json(content)
+            content, duration_ms = self._call_llm_sync(messages, DEFAULT_MAX_TOKENS)
+            llm_logger.log_rating(model=self.model, events=events,
+                                  messages=messages, response=content,
+                                  duration_ms=duration_ms)
+            result = self._unwrap_result(content, None)
             if result is None:
-                logger.error(f"LLM 返回JSON解析失败: {parse_error}, 原始内容: {content[:200]}")
                 return self._default_rating_result(events)
-
-            # 处理可能的包装格式
-            if isinstance(result, dict) and "results" in result:
-                result = result["results"]
-            elif isinstance(result, list):
-                pass
-            else:
-                logger.error(f"LLM 返回格式异常: {content[:200]}")
-                return self._default_rating_result(events)
-
-            # 处理结果：计算CVSS分数并映射severity
-            processed_result = []
-            for item in result:
-                # 修复 ID 格式
-                if "id" in item and isinstance(item["id"], str):
-                    match = re.search(r'\d+', str(item["id"]))
-                    if match:
-                        item["id"] = int(match.group())
-
-                # 验证并规范化CVSS指标值
-                ac = self._validate_cvss_metric(item.get("ac", "L"), ["L", "H"], "L")
-                pr = self._validate_cvss_metric(item.get("pr", "N"), ["N", "L", "H"], "N")
-                ui = self._validate_cvss_metric(item.get("ui", "N"), ["N", "P", "A"], "N")
-                vc = self._validate_cvss_metric(item.get("vc", "N"), ["N", "L", "H"], "N")
-                vi = self._validate_cvss_metric(item.get("vi", "N"), ["N", "L", "H"], "N")
-                va = self._validate_cvss_metric(item.get("va", "N"), ["N", "L", "H"], "N")
-
-                # 计算CVSS分数
-                cvss_score, cvss_vector = calculate_cvss_score(ac, pr, ui, vc, vi, va)
-
-                # 映射到severity
-                severity = cvss_score_to_severity(cvss_score)
-
-                processed_result.append({
-                    "id": item.get("id"),
-                    "severity": severity,
-                    "cvss_score": cvss_score,
-                    "cvss_vector": cvss_vector
-                })
-
-            return processed_result
+            self._normalize_result_ids(result)
+            return self._process_cvss_items(result, include_category=False)
 
         except Exception as e:
-            duration_ms = (time.time() - start_time) * 1000
-            error_msg = str(e)
             logger.error(f"LLM 评级失败: {e}")
-
-            # 记录失败调用
-            llm_logger.log_rating(
-                model=self.model,
-                events=events,
-                messages=messages,
-                error=error_msg,
-                duration_ms=duration_ms
-            )
-
+            llm_logger.log_rating(model=self.model, events=events,
+                                  messages=messages, error=str(e), duration_ms=0)
             return self._default_rating_result(events)
 
-    def _validate_cvss_metric(self, value: Any, valid_values: List[str], default: str) -> str:
-        """验证CVSS指标值
-
-        Args:
-            value: 输入值
-            valid_values: 有效值列表
-            default: 默认值
-
-        Returns:
-            验证后的值或默认值
-        """
-        if isinstance(value, str):
-            value_upper = value.upper()
-            if value_upper in valid_values:
-                return value_upper
+    def _validate_cvss_metric(self, value: Any, valid: List[str], default: str) -> str:
+        """验证 CVSS 指标值"""
+        if isinstance(value, str) and value.upper() in valid:
+            return value.upper()
         return default
+
+    def _process_cvss_items(self, items: List[Dict], include_category: bool = False) -> List[Dict]:
+        """将 LLM 返回的 CVSS 指标列表转化为含分数/severity 的结果"""
+        out = []
+        for item in items:
+            ac = self._validate_cvss_metric(item.get("ac", "L"), ["L", "H"], "L")
+            pr = self._validate_cvss_metric(item.get("pr", "N"), ["N", "L", "H"], "N")
+            ui = self._validate_cvss_metric(item.get("ui", "N"), ["N", "P", "A"], "N")
+            vc = self._validate_cvss_metric(item.get("vc", "N"), ["N", "L", "H"], "N")
+            vi = self._validate_cvss_metric(item.get("vi", "N"), ["N", "L", "H"], "N")
+            va = self._validate_cvss_metric(item.get("va", "N"), ["N", "L", "H"], "N")
+
+            score, vector = calculate_cvss_score(ac, pr, ui, vc, vi, va)
+            entry: Dict[str, Any] = {
+                "id": item.get("id"),
+                "severity": cvss_score_to_severity(score),
+                "cvss_score": score,
+                "cvss_vector": vector,
+            }
+            if include_category:
+                entry["category_code"] = item.get("category_code")
+            out.append(entry)
+        return out
 
     def _default_rating_result(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """生成默认的评级结果"""
@@ -514,279 +658,117 @@ class LLMService:
             "cvss_vector": ""
         } for e in events]
 
+    # ──────────────────────────────────────────
+    # 批量分类（同步）
+    # ──────────────────────────────────────────
+
     def batch_classify_events(self, events: List[Dict[str, Any]], categories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        批量分类事件
-
-        Args:
-            events: 事件列表，每个事件包含 id, title, description
-            categories: 分类列表，包含 code 和 name
-
-        Returns:
-            结果列表: [{"id": 1, "category_code": "prompt_injection"}, ...]
-        """
+        """批量分类事件"""
         if not self.is_available():
-            return [{"id": e["id"], "category_code": None} for e in events]
-
+            return self._default_classify_result(events)
         if not events:
             return []
+        chunks = self._chunk_events(events)
+        return self._run_concurrent(
+            lambda chunk: self._classify_events_chunk(chunk, categories), chunks
+        )
 
-        # 构建分类列表
-        categories_text = "\n".join([
-            f"- {c['code']}: {c['name']}" + (f" ({c.get('description')})" if c.get('description') else "")
+    def _classify_events_chunk(self, events: List[Dict], categories: List[Dict]) -> List[Dict]:
+        cats_text = "\n".join(
+            f"- {c['code']}: {c['name']}" + (f" ({c['description']})" if c.get("description") else "")
             for c in categories
-        ])
-
-        # 构建批量提示
-        events_text = "\n\n".join([
-            f"[事件{e['id']}]\n标题：{e['title']}\n描述：{(e.get('description') or e.get('raw_content') or '')[:300]}"
-            for e in events
-        ])
-
-        system_prompt = f"""你是一个AI安全事件分类专家。请将以下事件分类到最合适的类别。
+        )
+        system_prompt = f"""你是AI安全事件分类专家。将事件分类到最合适的类别。
 
 ## 可用分类
-{categories_text}
+{cats_text}
 
-## 输出要求
-请以JSON数组格式输出，每个事件一个对象，包含：
-- id: 事件ID（与输入一致）
-- category_code: 分类代码（必须是上述分类之一，如果无法分类则为 null）
+以JSON数组输出，每项包含 id、category_code（无法分类则为null）。
+示例：[{{"id":1,"category_code":"LLM01"}},{{"id":2,"category_code":"LLM06"}}]"""
 
-## 输出示例
-[
-  {{"id": 1, "category_code": "LLM01"}},
-  {{"id": 2, "category_code": "LLM06"}}
-]"""
-
-        user_prompt = f"请将以下{len(events)}个事件分类：\n\n{events_text}"
-
+        events_text = self._build_events_text(events, max_desc=300)
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": f"请分类以下{len(events)}个事件：\n\n{events_text}"},
         ]
         llm_logger = get_llm_logger()
-        start_time = time.time()
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0,
-                max_tokens=DEFAULT_MAX_TOKENS
-            )
-
-            content = response.choices[0].message.content
-            duration_ms = (time.time() - start_time) * 1000
-
-            # 记录成功调用
-            llm_logger.log_classification(
-                model=self.model,
-                events=events,
-                messages=messages,
-                response=content,
-                duration_ms=duration_ms
-            )
-
-            # 使用安全解析
-            result, parse_error = safe_parse_json(content)
+            content, duration_ms = self._call_llm_sync(messages, DEFAULT_MAX_TOKENS)
+            llm_logger.log_classification(model=self.model, events=events,
+                                          messages=messages, response=content,
+                                          duration_ms=duration_ms)
+            result = self._unwrap_result(content, None)
             if result is None:
-                logger.error(f"LLM 返回JSON解析失败: {parse_error}, 原始内容: {content[:200]}")
                 return self._default_classify_result(events)
-
-            # 处理可能的包装格式
-            if isinstance(result, dict) and "results" in result:
-                result = result["results"]
-            elif isinstance(result, list):
-                pass
-            else:
-                logger.error(f"LLM 返回格式异常: {content[:200]}")
-                return self._default_classify_result(events)
-
-            # 修复 ID 格式：LLM 可能返回 "事件9" 这样的字符串，需要提取数字
-            for item in result:
-                if "id" in item and isinstance(item["id"], str):
-                    match = re.search(r'\d+', str(item["id"]))
-                    if match:
-                        item["id"] = int(match.group())
-
+            self._normalize_result_ids(result)
             return result
 
         except Exception as e:
-            duration_ms = (time.time() - start_time) * 1000
-            error_msg = str(e)
             logger.error(f"LLM 分类失败: {e}")
-
-            # 记录失败调用
-            llm_logger.log_classification(
-                model=self.model,
-                events=events,
-                messages=messages,
-                error=error_msg,
-                duration_ms=duration_ms
-            )
-
+            llm_logger.log_classification(model=self.model, events=events,
+                                          messages=messages, error=str(e), duration_ms=0)
             return self._default_classify_result(events)
 
     def _default_classify_result(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """生成默认的分类结果"""
         return [{"id": e["id"], "category_code": None} for e in events]
 
+    # ──────────────────────────────────────────
+    # 批量评级 + 分类（同步）
+    # ──────────────────────────────────────────
+
     def batch_rate_and_classify(self, events: List[Dict[str, Any]], categories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        批量评级并分类事件 - 使用CVSS 4.0标准
-
-        Args:
-            events: 事件列表
-            categories: 分类列表
-
-        Returns:
-            结果列表: [{"id": 1, "severity": "high", "cvss_score": 8.7, "cvss_vector": "...", "category_code": "prompt_injection"}, ...]
-        """
+        """批量评级并分类事件（单次 LLM 调用完成两项任务）"""
         if not self.is_available():
             return self._default_rate_classify_result(events)
-
         if not events:
             return []
+        chunks = self._chunk_events(events)
+        return self._run_concurrent(
+            lambda chunk: self._rate_and_classify_chunk(chunk, categories), chunks
+        )
 
-        # 构建分类列表
-        categories_text = "\n".join([
-            f"- {c['code']}: {c['name']}"
-            for c in categories
-        ])
+    def _rate_and_classify_chunk(self, events: List[Dict], categories: List[Dict]) -> List[Dict]:
+        cats_text = "\n".join(f"- {c['code']}: {c['name']}" for c in categories)
+        system_prompt = f"""你是AI安全风险评估专家，使用CVSS 4.0评估LLM安全事件。
 
-        # 构建批量提示
-        events_text = "\n\n".join([
-            f"[事件{e['id']}]\n标题：{e['title']}\n描述：{(e.get('description') or e.get('raw_content') or '')[:800]}"
-            for e in events
-        ])
-
-        system_prompt = f"""你是一个AI安全风险评估专家，使用CVSS 4.0标准评估LLM安全事件。
-
-## CVSS 4.0 评估指标
-
-### 可利用性指标
-- AC (攻击复杂度): L=无需绕过安全机制/H=需要绕过安全机制
-- PR (所需权限): N=无需权限/L=普通用户权限/H=管理员权限
-- UI (用户交互): N=无需交互/P=被动交互/A=主动交互
-
-### 影响指标（脆弱系统）
-- VC (机密性影响): N=无泄露/L=部分泄露/H=全部/关键泄露
-- VI (完整性影响): N=无篡改/L=部分篡改/H=完全控制
-- VA (可用性影响): N=无中断/L=性能下降/H=完全不可用
+## CVSS 4.0 指标
+- AC(攻击复杂度): L=无需绕过安全机制 / H=需要绕过
+- PR(所需权限): N=无需 / L=普通用户 / H=管理员
+- UI(用户交互): N=无需 / P=被动 / A=主动
+- VC(机密性): N=无泄露 / L=部分 / H=全部/关键
+- VI(完整性): N=无篡改 / L=部分 / H=完全控制
+- VA(可用性): N=无中断 / L=性能下降 / H=完全不可用
 
 ## 可用分类
-{categories_text}
+{cats_text}
 
-## 输出要求
-以JSON数组输出，每个对象包含：
-- id: 事件ID
-- ac: 攻击复杂度 (L/H)
-- pr: 所需权限 (N/L/H)
-- ui: 用户交互 (N/P/A)
-- vc: 机密性影响 (N/L/H)
-- vi: 完整性影响 (N/L/H)
-- va: 可用性影响 (N/L/H)
-- category_code: 分类代码（必须是上述分类之一）
+以JSON数组输出，每项包含 id、ac、pr、ui、vc、vi、va、category_code。
+示例：[{{"id":1,"ac":"L","pr":"N","ui":"N","vc":"H","vi":"H","va":"N","category_code":"LLM01"}}]"""
 
-## 输出示例
-[
-  {{"id": 1, "ac": "L", "pr": "N", "ui": "N", "vc": "H", "vi": "H", "va": "N", "category_code": "LLM01"}},
-  {{"id": 2, "ac": "L", "pr": "N", "ui": "A", "vc": "L", "vi": "N", "va": "N", "category_code": "LLM06"}}
-]"""
-
-        user_prompt = f"请根据CVSS 4.0标准评估以下{len(events)}个LLM安全事件并分类：\n\n{events_text}"
-
+        events_text = self._build_events_text(events, max_desc=800)
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": f"请评估并分类以下{len(events)}个LLM安全事件：\n\n{events_text}"},
         ]
         llm_logger = get_llm_logger()
-        start_time = time.time()
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0,
-                max_tokens=DEFAULT_MAX_TOKENS
-            )
-
-            content = response.choices[0].message.content
-            duration_ms = (time.time() - start_time) * 1000
-
-            # 记录成功调用
-            llm_logger.log_rate_and_classify(
-                model=self.model,
-                events=events,
-                messages=messages,
-                response=content,
-                duration_ms=duration_ms
-            )
-
-            # 使用安全解析
-            result, parse_error = safe_parse_json(content)
+            content, duration_ms = self._call_llm_sync(messages, DEFAULT_MAX_TOKENS)
+            llm_logger.log_rate_and_classify(model=self.model, events=events,
+                                             messages=messages, response=content,
+                                             duration_ms=duration_ms)
+            result = self._unwrap_result(content, None)
             if result is None:
-                logger.error(f"LLM 返回JSON解析失败: {parse_error}, 原始内容: {content[:200] if content else ''}")
                 return self._default_rate_classify_result(events)
-
-            if isinstance(result, dict) and "results" in result:
-                result = result["results"]
-            elif isinstance(result, list):
-                pass
-            else:
-                logger.error(f"LLM 返回格式异常: {content[:200] if content else ''}")
-                return self._default_rate_classify_result(events)
-
-            # 处理结果：计算CVSS分数并映射severity
-            processed_result = []
-            for item in result:
-                # 修复 ID 格式
-                if "id" in item and isinstance(item["id"], str):
-                    match = re.search(r'\d+', str(item["id"]))
-                    if match:
-                        item["id"] = int(match.group())
-
-                # 验证并规范化CVSS指标值
-                ac = self._validate_cvss_metric(item.get("ac", "L"), ["L", "H"], "L")
-                pr = self._validate_cvss_metric(item.get("pr", "N"), ["N", "L", "H"], "N")
-                ui = self._validate_cvss_metric(item.get("ui", "N"), ["N", "P", "A"], "N")
-                vc = self._validate_cvss_metric(item.get("vc", "N"), ["N", "L", "H"], "N")
-                vi = self._validate_cvss_metric(item.get("vi", "N"), ["N", "L", "H"], "N")
-                va = self._validate_cvss_metric(item.get("va", "N"), ["N", "L", "H"], "N")
-
-                # 计算CVSS分数
-                cvss_score, cvss_vector = calculate_cvss_score(ac, pr, ui, vc, vi, va)
-
-                # 映射到severity
-                severity = cvss_score_to_severity(cvss_score)
-
-                processed_result.append({
-                    "id": item.get("id"),
-                    "severity": severity,
-                    "cvss_score": cvss_score,
-                    "cvss_vector": cvss_vector,
-                    "category_code": item.get("category_code")
-                })
-
-            return processed_result
+            self._normalize_result_ids(result)
+            return self._process_cvss_items(result, include_category=True)
 
         except Exception as e:
-            duration_ms = (time.time() - start_time) * 1000
-            error_msg = str(e)
             logger.error(f"LLM 评级分类失败: {e}")
-
-            # 记录失败调用
-            llm_logger.log_rate_and_classify(
-                model=self.model,
-                events=events,
-                messages=messages,
-                error=error_msg,
-                duration_ms=duration_ms
-            )
-
+            llm_logger.log_rate_and_classify(model=self.model, events=events,
+                                             messages=messages, error=str(e), duration_ms=0)
             return self._default_rate_classify_result(events)
 
     def _default_rate_classify_result(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -798,6 +780,107 @@ class LLMService:
             "cvss_vector": "",
             "category_code": None
         } for e in events]
+
+    # ──────────────────────────────────────────
+    # 异步版本（适用于 FastAPI / async 上下文）
+    # ──────────────────────────────────────────
+
+    async def async_batch_check_security(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """异步批量判断是否为 AI/LLM 安全事件"""
+        if not self.is_available():
+            return self._default_security_result(events, "LLM服务不可用")
+        if not events:
+            return []
+        chunks = self._chunk_events(events)
+        return await self._run_concurrent_async(self._async_check_security_chunk, chunks)
+
+    async def _async_check_security_chunk(self, events: List[Dict]) -> List[Dict]:
+        system_prompt = """You are an AI security event identification expert. Determine whether each event is an AI/LLM-related security event.
+
+✅ INCLUDE: Vulnerability disclosures, CVE announcements, attack techniques (prompt injection/jailbreaking/adversarial attacks), privacy leaks, model security risks, security mechanism bypasses
+❌ EXCLUDE: Product launches, feature updates, tutorial articles, industry news, commercial promotions, capability evaluations
+
+Output as a JSON array. Each item must contain:
+- id: integer (event ID)
+- is_security_event: boolean
+- reason: string (≤20 chars, brief explanation)
+
+Example: [{"id":1,"is_security_event":true,"reason":"CVE vulnerability"},{"id":2,"is_security_event":false,"reason":"Product update"}]"""
+        events_text = self._build_events_text(events, max_desc=300)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Determine whether the following {len(events)} events are AI/LLM security events:\n\n{events_text}"},
+        ]
+        try:
+            content, _ = await self._call_llm_async(messages, DEFAULT_MAX_TOKENS)
+            result = self._unwrap_result(content, None)
+            if result is None:
+                return self._default_security_result(events, "JSON解析失败")
+            self._normalize_result_ids(result)
+            return result
+        except Exception as e:
+            logger.error(f"[async] LLM 安全事件判断失败: {e}")
+            return self._default_security_result(events, "判断失败")
+
+    async def async_batch_rate_and_classify(self, events: List[Dict[str, Any]],
+                                            categories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """异步批量评级并分类事件"""
+        if not self.is_available():
+            return self._default_rate_classify_result(events)
+        if not events:
+            return []
+        chunks = self._chunk_events(events)
+        return await self._run_concurrent_async(
+            lambda chunk: self._async_rate_and_classify_chunk(chunk, categories), chunks
+        )
+
+    async def _async_rate_and_classify_chunk(self, events: List[Dict],
+                                             categories: List[Dict]) -> List[Dict]:
+        cats_text = "\n".join(f"- {c['code']}: {c['name']}" for c in categories)
+        system_prompt = f"""你是AI安全风险评估专家，使用CVSS 4.0评估LLM安全事件。
+
+## CVSS 4.0 指标
+- AC: L=无需绕过 / H=需要绕过  PR: N=无需 / L=普通 / H=管理员
+- UI: N=无需 / P=被动 / A=主动
+- VC/VI/VA: N=无影响 / L=部分 / H=严重
+
+## 可用分类
+{cats_text}
+
+以JSON数组输出，每项包含 id、ac、pr、ui、vc、vi、va、category_code。"""
+        events_text = self._build_events_text(events, max_desc=800)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"请评估并分类以下{len(events)}个LLM安全事件：\n\n{events_text}"},
+        ]
+        try:
+            content, _ = await self._call_llm_async(messages, DEFAULT_MAX_TOKENS)
+            result = self._unwrap_result(content, None)
+            if result is None:
+                return self._default_rate_classify_result(events)
+            self._normalize_result_ids(result)
+            return self._process_cvss_items(result, include_category=True)
+        except Exception as e:
+            logger.error(f"[async] LLM 评级分类失败: {e}")
+            return self._default_rate_classify_result(events)
+
+
+# 进度回调类型
+ProgressCallback = callable  # type: ignore
+
+# 全局进度回调（由任务层设置）
+_progress_callback: Optional[ProgressCallback] = None
+
+
+def set_progress_callback(callback: Optional[ProgressCallback]):
+    """设置进度回调函数"""
+    global _progress_callback
+    _progress_callback = callback
+
+
+def get_progress_callback() -> Optional[ProgressCallback]:
+    """获取当前进度回调"""
+    return _progress_callback
 
 
 # 单例实例

@@ -3,11 +3,12 @@
 """
 from typing import Optional
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class PreferenceBase(BaseModel):
     """用户偏好基础模型"""
+    model_config = ConfigDict(protected_namespaces=())
     model_id: Optional[int] = None
     category_id: Optional[int] = None
     is_enabled: bool = True

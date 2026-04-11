@@ -91,6 +91,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
+import { ElMessage } from 'element-plus'
 import { useAuthStore, useEventStore } from '../shared/stores'
 import { Expand, Loading } from '@element-plus/icons-vue'
 
@@ -108,12 +109,21 @@ const unreadCount = ref(0)
 const recentEvents = computed(() => eventStore.events.slice(0, 5))
 
 onMounted(async () => {
-  await authStore.init()
-  initializing.value = false
-  if (authStore.isLoggedIn) {
-    await eventStore.fetchRecommendEvents(1)
-    await eventStore.fetchUnreadCount()
-    unreadCount.value = eventStore.unreadCount
+  try {
+    await authStore.init()
+    initializing.value = false
+    if (authStore.isLoggedIn) {
+      try {
+        await eventStore.fetchRecommendEvents(1)
+        await eventStore.fetchUnreadCount()
+        unreadCount.value = eventStore.unreadCount
+      } catch (e) {
+        console.error('获取事件失败:', e)
+      }
+    }
+  } catch (e) {
+    console.error('初始化失败:', e)
+    initializing.value = false
   }
 })
 

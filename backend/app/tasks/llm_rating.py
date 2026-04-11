@@ -1,36 +1,33 @@
 """
 LLM自动处理任务
 支持关键词筛选 -> 安全判断 -> 评级/分类的处理流程
-采用串行处理：一次发送一批请求，间隔后发送下一批
-支持流式更新：每批处理完后提交数据库并更新状态
+LLM服务层统一处理批次并发和等待，任务层负责数据准备和状态更新
 
 处理流程：
 1. 关键词筛选（可选）
-2. LLM安全事件判断
-3. LLM评级/分类（根据开关配置）
+2. LLM安全事件判断（LLM服务自动分批并发）
+3. LLM评级/分类（LLM服务自动分批并发）
 """
 import logging
 import json
-import time
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple
 
 from app.core.database import SessionLocal
-from app.core.config import settings
 from app.models.system_config import SystemConfig
 from app.models.rss_event import RSSEvent
 from app.models.historical_event import HistoricalEvent
 from app.models.category import Category
 from app.models.event_model import EventModel
-from app.services.llm_service import get_llm_service, get_batch_size, MAX_BATCH_SIZE_LIMIT
+from app.services.llm_service import (
+    get_llm_service, get_max_concurrent_batches, get_request_interval,
+    get_batch_size, set_progress_callback, get_progress_callback
+)
 from app.services.model_matcher import match_event_models
 from app.services.keyword_filter import matches_keywords
 
 logger = logging.getLogger(__name__)
-
-# 请求间隔上限（秒）
-MAX_REQUEST_INTERVAL_LIMIT = 60
 
 # 全局状态（供状态查询接口使用）
 _rating_status = {
@@ -50,30 +47,23 @@ def get_rating_status() -> dict:
     return _rating_status.copy()
 
 
-def get_request_interval(db: Session) -> float:
-    """获取请求间隔时间（秒）"""
-    config = db.query(SystemConfig).filter(
-        SystemConfig.config_key == "llm_request_interval"
-    ).first()
-    if config and config.config_value:
-        try:
-            return min(float(config.config_value), MAX_REQUEST_INTERVAL_LIMIT)
-        except ValueError:
-            pass
-    return 2.0  # 默认值
+def _calculate_total_batches(n_events: int) -> int:
+    """计算处理指定数量事件需要的总批次"""
+    if n_events == 0:
+        return 0
+    batch_size = get_batch_size()
+    return (n_events + batch_size - 1) // batch_size  # 向上取整
 
 
-def get_configured_batch_size(db: Session) -> int:
-    """获取配置的批次大小"""
-    config = db.query(SystemConfig).filter(
-        SystemConfig.config_key == "llm_batch_size"
-    ).first()
-    if config and config.config_value:
-        try:
-            return min(int(config.config_value), MAX_BATCH_SIZE_LIMIT)
-        except ValueError:
-            pass
-    return get_batch_size()
+def _make_progress_callback():
+    """创建进度回调函数，用于更新 _rating_status"""
+    def callback(batch_completed: int, total_batches: int, events_processed: int):
+        global _rating_status
+        _rating_status["current_batch"] = batch_completed
+        _rating_status["total_batches"] = total_batches
+        _rating_status["processed"] = events_processed
+        logger.debug(f"进度更新: 批次 {batch_completed}/{total_batches}, 已处理 {events_processed}")
+    return callback
 
 
 def get_config_bool(db: Session, key: str, default: bool = False) -> bool:
@@ -90,8 +80,8 @@ def auto_process_events():
 
     处理流程：
     1. 关键词筛选（如果启用）
-    2. LLM安全事件判断
-    3. LLM评级/分类（根据开关配置）
+    2. LLM安全事件判断（LLM服务自动分批并发）
+    3. LLM评级/分类（LLM服务自动分批并发，根据开关配置）
 
     注意：历史数据（NVD/AIID/AIVD）不参与此流程，它们默认为安全事件
     """
@@ -113,8 +103,9 @@ def auto_process_events():
             logger.debug("LLM评级和分类均未启用")
             return
 
-        batch_size = get_configured_batch_size(db)
-        request_interval = get_request_interval(db)
+        # 获取并发配置（用于日志）
+        max_concurrent = get_max_concurrent_batches()
+        request_interval = get_request_interval()
 
         # 获取关键词筛选配置
         keyword_filter_enabled = get_config_bool(db, "keyword_filter_enabled")
@@ -144,17 +135,20 @@ def auto_process_events():
             logger.debug("没有待处理的RSS事件")
             return
 
-        # 分批
-        batches = [rss_events[i:i + batch_size] for i in range(0, len(rss_events), batch_size)]
         total_events = len(rss_events)
-        total_batches = len(batches)
+
+        # 估算总批次（两阶段：筛选判断 + 评级分类）
+        phase1_batches = _calculate_total_batches(total_events)
+        # phase2 批次数在筛选完成后才能确定，先预估
+        estimated_phase2_batches = _calculate_total_batches(total_events)
+        estimated_total_batches = phase1_batches + estimated_phase2_batches
 
         # 初始化状态
         _rating_status["running"] = True
         _rating_status["total"] = total_events
         _rating_status["processed"] = 0
         _rating_status["current_batch"] = 0
-        _rating_status["total_batches"] = total_batches
+        _rating_status["total_batches"] = estimated_total_batches
         _rating_status["error"] = None
         _rating_status["mode"] = "auto"
 
@@ -168,9 +162,12 @@ def auto_process_events():
 
         logger.info(
             f"开始自动处理: 共 {total_events} 条RSS事件, "
-            f"{total_batches} 批, 批次大小 {batch_size}, 间隔 {request_interval}秒, "
+            f"预计 {estimated_total_batches} 批次, 并发数 {max_concurrent}, 间隔 {request_interval}s, "
             f"模式: {process_mode}"
         )
+
+        # 设置进度回调
+        set_progress_callback(_make_progress_callback())
 
         llm_service = get_llm_service()
 
@@ -178,70 +175,41 @@ def auto_process_events():
         categories = db.query(Category).filter(Category.is_active == True).all()
         category_list = [{"code": c.code, "name": c.name, "description": c.description} for c in categories]
 
-        all_security_events = []
+        # 第一阶段：关键词筛选和安全判断
+        logger.info(f"阶段1: 筛选+判断，事件数: {total_events}")
 
-        # 第一阶段：逐批处理关键词筛选和安全判断
-        for batch_idx, batch in enumerate(batches):
-            _rating_status["current_batch"] = batch_idx + 1
+        all_security_events = _process_screening_phase(
+            db=db,
+            events=rss_events,
+            llm_service=llm_service,
+            keywords=keywords,
+            keyword_filter_enabled=keyword_filter_enabled
+        )
 
-            logger.info(f"处理第 {batch_idx + 1}/{total_batches} 批（筛选+判断），事件数: {len(batch)}")
-
-            try:
-                security_events = _process_batch_screening(
-                    db=db,
-                    events=batch,
-                    llm_service=llm_service,
-                    keywords=keywords,
-                    keyword_filter_enabled=keyword_filter_enabled
-                )
-
-                if security_events:
-                    all_security_events.extend(security_events)
-
-                _rating_status["processed"] += len(batch)
-                db.commit()
-
-            except Exception as e:
-                logger.error(f"第 {batch_idx + 1} 批筛选判断失败: {e}")
-
-            if batch_idx < total_batches - 1:
-                time.sleep(request_interval)
+        _rating_status["processed"] = len(all_security_events)
+        db.commit()
 
         logger.info(f"筛选判断完成: 安全事件 {len(all_security_events)} 条")
 
         if not all_security_events:
             return
 
-        # 第二阶段：逐批处理评级/分类
-        security_batches = [
-            all_security_events[i:i + batch_size]
-            for i in range(0, len(all_security_events), batch_size)
-        ]
+        # 更新总批次数（第二阶段的实际批次数）
+        phase2_batches = _calculate_total_batches(len(all_security_events))
+        total_batches = phase1_batches + phase2_batches
+        _rating_status["total_batches"] = total_batches
 
-        total_process_batches = len(security_batches)
-        _rating_status["total_batches"] = total_process_batches
-        _rating_status["current_batch"] = 0
+        # 第二阶段：评级/分类
+        logger.info(f"阶段2: {process_mode}，事件数: {len(all_security_events)}")
 
-        for batch_idx, batch in enumerate(security_batches):
-            _rating_status["current_batch"] = batch_idx + 1
-
-            logger.info(f"处理第 {batch_idx + 1}/{total_process_batches} 批（{process_mode}），事件数: {len(batch)}")
-
-            try:
-                _process_batch_rating_classify(
-                    db=db,
-                    events=batch,
-                    llm_service=llm_service,
-                    category_list=category_list,
-                    mode=process_mode
-                )
-                db.commit()
-
-            except Exception as e:
-                logger.error(f"第 {batch_idx + 1} 批{process_mode}失败: {e}")
-
-            if batch_idx < total_process_batches - 1:
-                time.sleep(request_interval)
+        _process_rating_classify_phase(
+            db=db,
+            events=all_security_events,
+            llm_service=llm_service,
+            category_list=category_list,
+            mode=process_mode
+        )
+        db.commit()
 
         # 第三阶段：识别模型
         models_matched = _identify_models_for_events(db, [(e, "rss") for e in all_security_events])
@@ -254,11 +222,13 @@ def auto_process_events():
         _rating_status["error"] = str(e)
         db.rollback()
     finally:
+        # 清除进度回调
+        set_progress_callback(None)
         _rating_status["running"] = False
         db.close()
 
 
-def _process_batch_screening(
+def _process_screening_phase(
     db: Session,
     events: List[Any],
     llm_service,
@@ -266,7 +236,7 @@ def _process_batch_screening(
     keyword_filter_enabled: bool
 ) -> List[Any]:
     """
-    处理单批次的关键词筛选和安全判断
+    处理关键词筛选和安全判断阶段
 
     Returns:
         确认为安全事件的事件列表
@@ -302,6 +272,7 @@ def _process_batch_screening(
             for e in events_need_judge
         ]
 
+        # LLM服务会自动分批、并发、等待
         security_results = llm_service.batch_check_security(events_data)
         security_map = {r["id"]: r for r in security_results}
 
@@ -320,7 +291,7 @@ def _process_batch_screening(
     return security_events
 
 
-def _process_batch_rating_classify(
+def _process_rating_classify_phase(
     db: Session,
     events: List[Any],
     llm_service,
@@ -328,7 +299,7 @@ def _process_batch_rating_classify(
     mode: str
 ):
     """
-    处理单批次的评级/分类
+    处理评级/分类阶段
 
     Args:
         mode: rate/classify/both
@@ -342,7 +313,7 @@ def _process_batch_rating_classify(
     ]
 
     if mode == "both":
-        # 一次调用完成评级和分类
+        # LLM服务会自动分批、并发、等待
         results = llm_service.batch_rate_and_classify(events_data, category_list)
         result_map = {r["id"]: r for r in results}
 
@@ -446,7 +417,7 @@ def manual_process_events_async(
     mode: str = "rate"
 ):
     """
-    手动触发处理（后台任务，支持流式更新）
+    手动触发处理（后台任务）
 
     Args:
         event_ids: 事件ID列表
@@ -469,15 +440,14 @@ def manual_process_events_async(
             _rating_status["error"] = "未找到事件"
             return
 
-        # 获取配置
-        batch_size = get_configured_batch_size(db)
-        request_interval = get_request_interval(db)
+        # 获取并发配置（用于日志）
+        max_concurrent = get_max_concurrent_batches()
+        request_interval = get_request_interval()
 
         # 获取分类列表
         categories = db.query(Category).filter(Category.is_active == True).all()
         category_list = [{"code": c.code, "name": c.name, "description": c.description} for c in categories]
 
-        # 先筛选再分批
         # check_security 模式：处理所有事件
         # rate/classify/both 模式：只处理 is_security_event=True 的事件
         if mode == "check_security":
@@ -506,9 +476,8 @@ def manual_process_events_async(
             _rating_status["event_type"] = None
             return
 
-        # 分批
-        batches = [events_to_process[i:i + batch_size] for i in range(0, len(events_to_process), batch_size)]
-        total_batches = len(batches)
+        # 计算实际批次数量
+        total_batches = _calculate_total_batches(len(events_to_process))
 
         # 初始化状态
         _rating_status["running"] = True
@@ -522,43 +491,68 @@ def manual_process_events_async(
 
         logger.info(
             f"开始手动处理: 选中 {len(events)} 条, 安全事件 {len(events_to_process)} 条, "
-            f"{total_batches} 批, 批次大小 {batch_size}, 模式 {mode}"
+            f"共 {total_batches} 批次, 并发数 {max_concurrent}, 间隔 {request_interval}s, 模式 {mode}"
         )
 
+        # 设置进度回调
+        set_progress_callback(_make_progress_callback())
+
         llm_service = get_llm_service()
+
+        # 一次性处理所有事件（LLM服务会自动分批、并发、等待，并通过回调更新进度）
+        events_data = [
+            {"id": e.id, "title": e.title, "description": e.description, "raw_content": e.raw_content}
+            for e in events_to_process
+        ]
+
         processed = 0
         models_matched = 0
 
-        # 逐批处理
-        for batch_idx, batch in enumerate(batches):
-            _rating_status["current_batch"] = batch_idx + 1
+        if mode == "check_security":
+            results = llm_service.batch_check_security(events_data)
+            result_map = {r["id"]: r for r in results}
 
-            logger.info(f"处理第 {batch_idx + 1}/{total_batches} 批，事件数: {len(batch)}")
+            for event in events_to_process:
+                result = result_map.get(event.id, {"is_security_event": True})
+                event.is_security_event = result.get("is_security_event", True)
+                processed += 1
 
-            try:
-                batch_processed, batch_models = _process_single_batch_manual(
-                    db=db,
-                    events=batch,
-                    llm_service=llm_service,
-                    category_list=category_list,
-                    event_type=event_type,
-                    mode=mode
-                )
+        elif mode == "rate":
+            results = llm_service.batch_rate_events(events_data)
+            result_map = {r["id"]: r for r in results}
 
-                processed += batch_processed
-                models_matched += batch_models
-                _rating_status["processed"] = processed
+            for event in events_to_process:
+                result = result_map.get(event.id, {})
+                _apply_rating_result(event, result)
+                event.is_processed = True
+                processed += 1
+                models_matched += _identify_and_create_event_models(db, event, event_type)
 
-                # 每批处理后立即提交数据库（流式更新）
-                db.commit()
+        elif mode == "classify":
+            results = llm_service.batch_classify_events(events_data, category_list)
+            result_map = {r["id"]: r for r in results}
 
-            except Exception as e:
-                logger.error(f"第 {batch_idx + 1} 批处理失败: {e}")
-                _rating_status["error"] = f"第 {batch_idx + 1} 批处理失败: {e}"
+            for event in events_to_process:
+                result = result_map.get(event.id, {})
+                _apply_classify_result(db, event, result, category_list)
+                event.is_processed = True
+                processed += 1
+                models_matched += _identify_and_create_event_models(db, event, event_type)
 
-            # 等待间隔时间（最后一批不等待）
-            if batch_idx < total_batches - 1:
-                time.sleep(request_interval)
+        elif mode == "both":
+            results = llm_service.batch_rate_and_classify(events_data, category_list)
+            result_map = {r["id"]: r for r in results}
+
+            for event in events_to_process:
+                result = result_map.get(event.id, {})
+                _apply_rating_result(event, result)
+                _apply_classify_result(db, event, result, category_list)
+                event.is_processed = True
+                processed += 1
+                models_matched += _identify_and_create_event_models(db, event, event_type)
+
+        _rating_status["processed"] = processed
+        db.commit()
 
         logger.info(f"处理完成: 共处理 {processed} 条事件, 模型识别 {models_matched} 个关联")
 
@@ -567,6 +561,8 @@ def manual_process_events_async(
         _rating_status["error"] = str(e)
         db.rollback()
     finally:
+        # 清除进度回调
+        set_progress_callback(None)
         _rating_status["running"] = False
         _rating_status["mode"] = None
         _rating_status["event_type"] = None
@@ -582,11 +578,9 @@ def _process_single_batch_manual(
     mode: str
 ) -> Tuple[int, int]:
     """
-    处理单个批次（手动模式）
+    处理单个批次（手动模式）- 保留用于兼容
 
-    注意：调用此函数前，events 已经在 manual_process_events_async 中完成筛选
-    - check_security 模式：所有选中事件
-    - rate/classify/both 模式：仅 is_security_event=True 的事件
+    注意：此函数已被 manual_process_events_async 内联逻辑替代，保留用于向后兼容
 
     Returns:
         (处理数量, 模型关联数量)
@@ -677,14 +671,12 @@ def manual_process_events(
     if not events:
         return {"total": 0, "processed": 0, "message": "未找到事件"}
 
-    # 获取配置
-    batch_size = get_configured_batch_size(db)
-
     # 获取分类列表
     categories = db.query(Category).filter(Category.is_active == True).all()
     category_list = [{"code": c.code, "name": c.name, "description": c.description} for c in categories]
 
-    # 先筛选再分批
+    # check_security 模式：处理所有事件
+    # rate/classify/both 模式：只处理 is_security_event=True 的事件
     if mode == "check_security":
         events_to_process = events
     else:
@@ -699,23 +691,59 @@ def manual_process_events(
             "message": f"选中 {len(events)} 条，无安全事件需要处理"
         }
 
-    batches = [events_to_process[i:i + batch_size] for i in range(0, len(events_to_process), batch_size)]
-
     llm_service = get_llm_service()
+
+    # 一次性处理所有事件（LLM服务会自动分批、并发、等待）
+    events_data = [
+        {"id": e.id, "title": e.title, "description": e.description, "raw_content": e.raw_content}
+        for e in events_to_process
+    ]
+
     processed = 0
     models_matched = 0
 
-    for batch in batches:
-        batch_processed, batch_models = _process_single_batch_manual(
-            db=db,
-            events=batch,
-            llm_service=llm_service,
-            category_list=category_list,
-            event_type=event_type,
-            mode=mode
-        )
-        processed += batch_processed
-        models_matched += batch_models
+    if mode == "check_security":
+        results = llm_service.batch_check_security(events_data)
+        result_map = {r["id"]: r for r in results}
+
+        for event in events_to_process:
+            result = result_map.get(event.id, {"is_security_event": True})
+            event.is_security_event = result.get("is_security_event", True)
+            processed += 1
+
+    elif mode == "rate":
+        results = llm_service.batch_rate_events(events_data)
+        result_map = {r["id"]: r for r in results}
+
+        for event in events_to_process:
+            result = result_map.get(event.id, {})
+            _apply_rating_result(event, result)
+            event.is_processed = True
+            processed += 1
+            models_matched += _identify_and_create_event_models(db, event, event_type)
+
+    elif mode == "classify":
+        results = llm_service.batch_classify_events(events_data, category_list)
+        result_map = {r["id"]: r for r in results}
+
+        for event in events_to_process:
+            result = result_map.get(event.id, {})
+            _apply_classify_result(db, event, result, category_list)
+            event.is_processed = True
+            processed += 1
+            models_matched += _identify_and_create_event_models(db, event, event_type)
+
+    elif mode == "both":
+        results = llm_service.batch_rate_and_classify(events_data, category_list)
+        result_map = {r["id"]: r for r in results}
+
+        for event in events_to_process:
+            result = result_map.get(event.id, {})
+            _apply_rating_result(event, result)
+            _apply_classify_result(db, event, result, category_list)
+            event.is_processed = True
+            processed += 1
+            models_matched += _identify_and_create_event_models(db, event, event_type)
 
     db.commit()
 

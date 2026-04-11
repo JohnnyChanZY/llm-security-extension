@@ -96,8 +96,11 @@
           :indeterminate="true"
         />
         <span class="progress-text">
-          <template v-if="taskStatus.running">
-            处理中... 第 {{ taskStatus.current_batch }}/{{ taskStatus.total_batches }} 批
+          <template v-if="taskStatus.running && taskStatus.total_batches > 0">
+            处理中... 第 {{ taskStatus.current_batch }}/{{ taskStatus.total_batches }} 批 ({{ taskStatus.processed }}/{{ taskStatus.total }} 条)
+          </template>
+          <template v-else-if="taskStatus.running">
+            处理中... 已处理 {{ taskStatus.processed }} 条
           </template>
           <template v-else-if="processing">
             正在启动...
