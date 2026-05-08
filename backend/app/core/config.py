@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # LLM 批处理配置
     llm_batch_size: int = 30  # 单次 LLM 请求最多处理的事件数
 
+    # CORS 允许的来源（逗号分隔）
+    cors_origins: str = "http://localhost:3000,http://localhost:5173,http://localhost:8000,http://127.0.0.1:3000,http://127.0.0.1:5173,http://127.0.0.1:8000"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

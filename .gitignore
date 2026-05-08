@@ -63,6 +63,8 @@ htmlcov/
 # Chrome Extension
 extension/dist/
 extension/.crx/
+extension/dist.crx
+extension/dist.pem
 
 # OS files
 .DS_Store
