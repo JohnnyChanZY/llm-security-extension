@@ -56,6 +56,13 @@ npm run build    # Production build
 
 Note: Admin panel proxies `/api/*` requests to `http://127.0.0.1:8000` in development.
 
+### Quick Start (Windows)
+
+```bash
+dev-start.bat    # Starts backend, extension dev server, and admin panel
+dev-stop.bat     # Stops all services
+```
+
 ## Architecture
 
 ### Three-Tier Structure
@@ -182,6 +189,19 @@ When importing icons from `@element-plus/icons-vue`, use correct names:
 3. Create service methods in `services/`
 4. Create router in `api/v1/` or `api/admin/`
 5. Register router in `api/v1/__init__.py` or `api/admin/__init__.py`
+
+### CVSS Vulnerability Scoring
+
+The system uses the `cvss` Python library for vulnerability severity scoring. NVD events include CVSS metrics (score, vector, severity). See `backend/app/services/nvd_collector.py` for collection and `backend/app/models/historical_event.py` for storage.
+
+### Utility Scripts
+
+- `backend/scripts/import_rss_sources.py` - Bulk import RSS sources from a file
+- Root-level `requirements.txt` is a duplicate of `backend/requirements.txt` (minus `cvss`); use the backend one as authoritative.
+
+### No Automated Tests or CI/CD
+
+This project has no test framework or CI/CD pipeline. The `test/` directory contains manual test documentation only. If adding tests, set up `pytest` with `conftest.py` in `backend/`.
 
 ### Adding Scheduled Tasks
 

@@ -21,6 +21,7 @@ from app.tasks.llm_rating import (
     get_rating_status
 )
 from app.services.llm_service import MAX_BATCH_SIZE_LIMIT
+from app.services.operation_logger import log_operation
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -48,7 +49,8 @@ class BatchOperationRequest(BaseModel):
 @router.post("/trigger", response_model=ResponseModel)
 def trigger_auto_process(
     background_tasks: BackgroundTasks,
-    current_admin: User = Depends(get_current_admin)
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
 ):
     """手动触发自动处理任务（后台运行）"""
     status = get_rating_status()
@@ -62,6 +64,12 @@ def trigger_auto_process(
 
     background_tasks.add_task(auto_process_events)
 
+    log_operation(
+        db=db, user_id=current_admin.id, action="trigger_auto_process",
+        target_type="rating",
+        details="手动触发自动处理任务"
+    )
+
     return ResponseModel(
         code=0,
         message="处理任务已启动",
@@ -73,7 +81,8 @@ def trigger_auto_process(
 def trigger_process(
     request: ManualProcessRequest,
     background_tasks: BackgroundTasks,
-    current_admin: User = Depends(get_current_admin)
+    current_admin: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
 ):
     """
     手动触发处理（后台运行，支持流式更新）
@@ -112,6 +121,12 @@ def trigger_process(
         event_ids=request.event_ids,
         event_type=request.event_type,
         mode=request.mode
+    )
+
+    log_operation(
+        db=db, user_id=current_admin.id, action="process_events",
+        target_type="rating",
+        details=f"手动处理 {len(request.event_ids)} 条{request.event_type}事件, 模式: {request.mode}"
     )
 
     return ResponseModel(
@@ -222,11 +237,15 @@ def execute_batch_operations(
     else:
         mode = "check_security"
 
+    # 如果同时包含 judge 和 rate/classify，先执行安全判断再执行评级/分类
+    run_judge_first = has_judge and (has_rate or has_classify)
+
     background_tasks.add_task(
         manual_process_events_async,
         event_ids=request.event_ids,
         event_type=request.event_type,
-        mode=mode
+        mode=mode,
+        run_judge_first=run_judge_first
     )
 
     return ResponseModel(

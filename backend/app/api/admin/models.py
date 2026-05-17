@@ -11,6 +11,7 @@ from app.models.model import Model
 from app.schemas.model import ModelCreate, ModelUpdate, ModelResponse
 from app.schemas.response import ResponseModel
 from app.api.deps import get_current_admin, not_found_exception
+from app.services.operation_logger import log_operation
 
 router = APIRouter()
 
@@ -50,6 +51,12 @@ def create_model(
     db.commit()
     db.refresh(model)
 
+    log_operation(
+        db, user_id=current_admin.id, action="create_model",
+        target_type="model", target_id=model.id,
+        details=f"创建模型: {model.name}"
+    )
+
     return ResponseModel(
         code=0,
         message="创建成功",
@@ -84,6 +91,12 @@ def update_model(
     db.commit()
     db.refresh(model)
 
+    log_operation(
+        db, user_id=current_admin.id, action="update_model",
+        target_type="model", target_id=model.id,
+        details=f"更新模型: {model.name}"
+    )
+
     return ResponseModel(
         code=0,
         message="更新成功",
@@ -103,7 +116,14 @@ def delete_model(
     if not model:
         raise not_found_exception("模型不存在")
 
+    model_name = model.name
     db.delete(model)
     db.commit()
+
+    log_operation(
+        db, user_id=current_admin.id, action="delete_model",
+        target_type="model", target_id=model_id,
+        details=f"删除模型: {model_name}"
+    )
 
     return ResponseModel(code=0, message="删除成功")

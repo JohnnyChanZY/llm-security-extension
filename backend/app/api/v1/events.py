@@ -86,8 +86,11 @@ def get_events(
     """获取事件列表"""
     # 查询历史事件
     historical_query = db.query(HistoricalEvent)
-    # 查询RSS事件
-    rss_query = db.query(RSSEvent)
+    # 查询RSS事件（仅已处理且确认为安全事件的）
+    rss_query = db.query(RSSEvent).filter(
+        RSSEvent.is_security_event == True,
+        RSSEvent.is_processed == True
+    )
 
     # 应用筛选条件
     if category:
@@ -185,7 +188,11 @@ def get_unread_count(
     """获取未读事件数量"""
     # 这里简化处理，返回最近的未处理事件数量
     # 实际应该有用户已读记录表
-    count = db.query(RSSEvent).filter(RSSEvent.is_pushed == False).count()
+    count = db.query(RSSEvent).filter(
+        RSSEvent.is_pushed == False,
+        RSSEvent.is_security_event == True,
+        RSSEvent.is_processed == True
+    ).count()
     return ResponseModel(
         code=0,
         data={"count": count}
@@ -200,8 +207,11 @@ def get_recommend_events(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """获取推荐事件（全部最新事件）"""
-    query = db.query(RSSEvent)
+    """获取推荐事件（已处理且确认为安全事件的最新事件）"""
+    query = db.query(RSSEvent).filter(
+        RSSEvent.is_security_event == True,
+        RSSEvent.is_processed == True
+    )
 
     # 应用分类过滤
     if category:
@@ -293,8 +303,12 @@ def get_subscribed_events(
         ).subquery()
         conditions.append(RSSEvent.id.in_(event_ids_by_model))
 
-    # 查询匹配的RSS事件
-    query = db.query(RSSEvent).filter(or_(*conditions))
+    # 查询匹配的RSS事件（仅已处理且确认为安全事件的）
+    query = db.query(RSSEvent).filter(
+        or_(*conditions),
+        RSSEvent.is_security_event == True,
+        RSSEvent.is_processed == True
+    )
 
     # 应用额外的分类参数过滤（用户在UI上选择的分类）
     if category:

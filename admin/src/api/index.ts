@@ -120,4 +120,15 @@ export const syncApi = {
   syncAIVD: () => api.post('/admin/sync/aivd')
 }
 
+// 仪表盘API
+export const dashboardApi = {
+  getStats: () => api.get('/admin/dashboard/stats')
+}
+
+// 操作日志API
+export const logsApi = {
+  getAll: (params: { page?: number; page_size?: number }) =>
+    api.get('/admin/logs', { params })
+}
+
 export default api

@@ -1,7 +1,7 @@
 # Admin API Module
 from fastapi import APIRouter
 
-from . import config, rss_sources, models, rating, sync, events
+from . import config, rss_sources, models, rating, sync, events, dashboard, logs
 
 router = APIRouter()
 
@@ -11,3 +11,5 @@ router.include_router(models.router, prefix="/models", tags=["模型管理"])
 router.include_router(rating.router, prefix="/rating", tags=["LLM评级"])
 router.include_router(sync.router, prefix="/sync", tags=["数据同步"])
 router.include_router(events.router, prefix="/events", tags=["事件管理"])
+router.include_router(dashboard.router, prefix="/dashboard", tags=["仪表盘"])
+router.include_router(logs.router, prefix="/logs", tags=["操作日志"])

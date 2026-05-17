@@ -497,6 +497,10 @@ class LLMService:
             return None
         if isinstance(parsed, dict) and "results" in parsed:
             parsed = parsed["results"]
+        # LLM 可能对单个事件返回对象而非数组，自动包装
+        if isinstance(parsed, dict):
+            logger.debug(f"LLM返回单个对象，自动包装为数组: {content[:100]}")
+            parsed = [parsed]
         if not isinstance(parsed, list):
             logger.error(f"返回格式异常: {content[:200]}")
             return None
@@ -524,22 +528,36 @@ class LLMService:
         return self._run_concurrent(self._check_security_chunk, chunks)
 
     def _check_security_chunk(self, events: List[Dict]) -> List[Dict]:
-        system_prompt = """You are an AI security event identification expert. Determine whether each event is an AI/LLM-related security event.
+        system_prompt = """你是AI/LLM安全事件识别专家。判断每个事件是否属于AI/LLM安全相关事件。
 
-✅ INCLUDE: Vulnerability disclosures, CVE announcements, attack techniques (prompt injection/jailbreaking/adversarial attacks), privacy leaks, model security risks, security mechanism bypasses
-❌ EXCLUDE: Product launches, feature updates, tutorial articles, industry news, commercial promotions, capability evaluations
+✅ 属于安全事件（is_security_event=true）：
+- CVE漏洞披露、安全补丁公告
+- 提示词注入(Prompt Injection)、越狱(Jailbreak)攻击
+- 对抗样本攻击、模型逃逸
+- 训练数据泄露、隐私信息泄露
+- 模型后门、供应链攻击
+- 安全机制绕过、权限提升
+- 数据投毒、模型篡改
+- 拒绝服务(DoS)攻击相关
 
-Output as a JSON array. Each item must contain:
-- id: integer (event ID)
-- is_security_event: boolean
-- reason: string (≤20 chars, brief explanation)
+❌ 不属于安全事件（is_security_event=false）：
+- 产品发布、功能更新、版本迭代
+- 使用教程、操作指南
+- 行业新闻、市场分析
+- 商业推广、合作公告
+- 模型能力评测、性能对比（非安全维度）
 
-Example: [{"id":1,"is_security_event":true,"reason":"CVE vulnerability"},{"id":2,"is_security_event":false,"reason":"Product update"}]"""
+以JSON数组输出，每项必须包含：
+- id: 整数（事件ID）
+- is_security_event: 布尔值
+- reason: 字符串（≤20字，简要说明）
+
+示例：[{"id":1,"is_security_event":true,"reason":"CVE漏洞披露"},{"id":2,"is_security_event":false,"reason":"产品功能更新"}]"""
 
         events_text = self._build_events_text(events, max_desc=300)
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Determine whether the following {len(events)} events are AI/LLM security events:\n\n{events_text}"},
+            {"role": "user", "content": f"请判断以下{len(events)}个事件是否属于AI/LLM安全事件：\n\n{events_text}"},
         ]
         llm_logger = get_llm_logger()
 
@@ -585,15 +603,20 @@ Example: [{"id":1,"is_security_event":true,"reason":"CVE vulnerability"},{"id":2
     def _rate_events_chunk(self, events: List[Dict]) -> List[Dict]:
         system_prompt = """你是AI安全风险评估专家，使用CVSS 4.0评估LLM安全事件严重程度。
 
-## CVSS 4.0 指标
-- AC(攻击复杂度): L=无需绕过安全机制 / H=需要绕过
-- PR(所需权限): N=无需 / L=普通用户 / H=管理员
-- UI(用户交互): N=无需 / P=被动 / A=主动
-- VC(机密性): N=无泄露 / L=部分泄露 / H=全部/关键泄露
-- VI(完整性): N=无篡改 / L=部分篡改 / H=完全控制
-- VA(可用性): N=无中断 / L=性能下降 / H=完全不可用
+## CVSS 4.0 指标（请根据事件描述逐项评估）
+- AC(攻击复杂度): L=无需绕过安全机制即可利用 / H=需要绕过特定安全机制
+- PR(所需权限): N=无需任何权限 / L=需要普通用户权限 / H=需要管理员权限
+- UI(用户交互): N=无需用户交互 / P=需要用户被动点击等 / A=需要用户主动参与
+- VC(机密性影响): N=无泄露 / L=部分敏感数据泄露 / H=全部/关键数据泄露
+- VI(完整性影响): N=无篡改 / L=部分数据被篡改 / H=完全控制数据
+- VA(可用性影响): N=无中断 / L=性能下降或部分不可用 / H=完全不可用
 
-以JSON数组输出，每项包含 id、ac、pr、ui、vc、vi、va。
+## 评估原则
+- 根据漏洞实际可利用性和影响范围评估，不要一律给高或一律给低
+- 考虑攻击是否需要特殊条件（如需要登录、需要用户交互等）
+- 数据泄露类事件重点关注VC，篡改类重点关注VI，DoS类重点关注VA
+
+必须以JSON数组输出，每项包含 id、ac、pr、ui、vc、vi、va。
 示例：[{"id":1,"ac":"L","pr":"N","ui":"N","vc":"H","vi":"H","va":"N"}]"""
 
         events_text = self._build_events_text(events, max_desc=800)
@@ -683,13 +706,18 @@ Example: [{"id":1,"is_security_event":true,"reason":"CVE vulnerability"},{"id":2
 ## 可用分类
 {cats_text}
 
-以JSON数组输出，每项包含 id、category_code（无法分类则为null）。
+## 分类原则
+- 根据事件的核心安全问题分类，而非表面描述
+- 如果事件涉及多个类别，选择最主要的安全风险类别
+- 确实无法匹配任何分类时，category_code设为null（系统会自动归入"其他"）
+
+必须以JSON数组输出，每项包含 id、category_code。
 示例：[{{"id":1,"category_code":"LLM01"}},{{"id":2,"category_code":"LLM06"}}]"""
 
         events_text = self._build_events_text(events, max_desc=300)
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"请分类以下{len(events)}个事件：\n\n{events_text}"},
+            {"role": "user", "content": f"请对以下{len(events)}个AI/LLM安全事件进行分类：\n\n{events_text}"},
         ]
         llm_logger = get_llm_logger()
 
@@ -731,20 +759,28 @@ Example: [{"id":1,"is_security_event":true,"reason":"CVE vulnerability"},{"id":2
 
     def _rate_and_classify_chunk(self, events: List[Dict], categories: List[Dict]) -> List[Dict]:
         cats_text = "\n".join(f"- {c['code']}: {c['name']}" for c in categories)
-        system_prompt = f"""你是AI安全风险评估专家，使用CVSS 4.0评估LLM安全事件。
+        system_prompt = f"""你是AI安全风险评估专家，使用CVSS 4.0评估LLM安全事件并分类。
 
-## CVSS 4.0 指标
-- AC(攻击复杂度): L=无需绕过安全机制 / H=需要绕过
-- PR(所需权限): N=无需 / L=普通用户 / H=管理员
-- UI(用户交互): N=无需 / P=被动 / A=主动
-- VC(机密性): N=无泄露 / L=部分 / H=全部/关键
-- VI(完整性): N=无篡改 / L=部分 / H=完全控制
-- VA(可用性): N=无中断 / L=性能下降 / H=完全不可用
+## CVSS 4.0 指标（请根据事件描述逐项评估）
+- AC(攻击复杂度): L=无需绕过安全机制即可利用 / H=需要绕过特定安全机制
+- PR(所需权限): N=无需任何权限 / L=需要普通用户权限 / H=需要管理员权限
+- UI(用户交互): N=无需用户交互 / P=需要用户被动点击等 / A=需要用户主动参与
+- VC(机密性影响): N=无泄露 / L=部分敏感数据泄露 / H=全部/关键数据泄露
+- VI(完整性影响): N=无篡改 / L=部分数据被篡改 / H=完全控制数据
+- VA(可用性影响): N=无中断 / L=性能下降或部分不可用 / H=完全不可用
+
+## 评估原则
+- 根据漏洞实际可利用性和影响范围评估，不要一律给高或一律给低
+- 考虑攻击是否需要特殊条件（如需要登录、需要用户交互等）
 
 ## 可用分类
 {cats_text}
 
-以JSON数组输出，每项包含 id、ac、pr、ui、vc、vi、va、category_code。
+## 分类原则
+- 根据事件的核心安全问题分类，而非表面描述
+- 确实无法匹配时，category_code设为null
+
+必须以JSON数组输出，每项包含 id、ac、pr、ui、vc、vi、va、category_code。
 示例：[{{"id":1,"ac":"L","pr":"N","ui":"N","vc":"H","vi":"H","va":"N","category_code":"LLM01"}}]"""
 
         events_text = self._build_events_text(events, max_desc=800)
@@ -795,21 +831,35 @@ Example: [{"id":1,"is_security_event":true,"reason":"CVE vulnerability"},{"id":2
         return await self._run_concurrent_async(self._async_check_security_chunk, chunks)
 
     async def _async_check_security_chunk(self, events: List[Dict]) -> List[Dict]:
-        system_prompt = """You are an AI security event identification expert. Determine whether each event is an AI/LLM-related security event.
+        system_prompt = """你是AI/LLM安全事件识别专家。判断每个事件是否属于AI/LLM安全相关事件。
 
-✅ INCLUDE: Vulnerability disclosures, CVE announcements, attack techniques (prompt injection/jailbreaking/adversarial attacks), privacy leaks, model security risks, security mechanism bypasses
-❌ EXCLUDE: Product launches, feature updates, tutorial articles, industry news, commercial promotions, capability evaluations
+✅ 属于安全事件（is_security_event=true）：
+- CVE漏洞披露、安全补丁公告
+- 提示词注入(Prompt Injection)、越狱(Jailbreak)攻击
+- 对抗样本攻击、模型逃逸
+- 训练数据泄露、隐私信息泄露
+- 模型后门、供应链攻击
+- 安全机制绕过、权限提升
+- 数据投毒、模型篡改
+- 拒绝服务(DoS)攻击相关
 
-Output as a JSON array. Each item must contain:
-- id: integer (event ID)
-- is_security_event: boolean
-- reason: string (≤20 chars, brief explanation)
+❌ 不属于安全事件（is_security_event=false）：
+- 产品发布、功能更新、版本迭代
+- 使用教程、操作指南
+- 行业新闻、市场分析
+- 商业推广、合作公告
+- 模型能力评测、性能对比（非安全维度）
 
-Example: [{"id":1,"is_security_event":true,"reason":"CVE vulnerability"},{"id":2,"is_security_event":false,"reason":"Product update"}]"""
+以JSON数组输出，每项必须包含：
+- id: 整数（事件ID）
+- is_security_event: 布尔值
+- reason: 字符串（≤20字，简要说明）
+
+示例：[{"id":1,"is_security_event":true,"reason":"CVE漏洞披露"},{"id":2,"is_security_event":false,"reason":"产品功能更新"}]"""
         events_text = self._build_events_text(events, max_desc=300)
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Determine whether the following {len(events)} events are AI/LLM security events:\n\n{events_text}"},
+            {"role": "user", "content": f"请判断以下{len(events)}个事件是否属于AI/LLM安全事件：\n\n{events_text}"},
         ]
         try:
             content, _ = await self._call_llm_async(messages, DEFAULT_MAX_TOKENS)
@@ -837,17 +887,25 @@ Example: [{"id":1,"is_security_event":true,"reason":"CVE vulnerability"},{"id":2
     async def _async_rate_and_classify_chunk(self, events: List[Dict],
                                              categories: List[Dict]) -> List[Dict]:
         cats_text = "\n".join(f"- {c['code']}: {c['name']}" for c in categories)
-        system_prompt = f"""你是AI安全风险评估专家，使用CVSS 4.0评估LLM安全事件。
+        system_prompt = f"""你是AI安全风险评估专家，使用CVSS 4.0评估LLM安全事件并分类。
 
-## CVSS 4.0 指标
-- AC: L=无需绕过 / H=需要绕过  PR: N=无需 / L=普通 / H=管理员
-- UI: N=无需 / P=被动 / A=主动
-- VC/VI/VA: N=无影响 / L=部分 / H=严重
+## CVSS 4.0 指标（请根据事件描述逐项评估）
+- AC: L=无需绕过安全机制即可利用 / H=需要绕过特定安全机制
+- PR: N=无需任何权限 / L=需要普通用户权限 / H=需要管理员权限
+- UI: N=无需用户交互 / P=需要用户被动点击等 / A=需要用户主动参与
+- VC/VI/VA: N=无影响 / L=部分影响 / H=严重影响
+
+## 评估原则
+- 根据漏洞实际可利用性和影响范围评估，不要一律给高或一律给低
+- 考虑攻击是否需要特殊条件（如需要登录、需要用户交互等）
 
 ## 可用分类
 {cats_text}
 
-以JSON数组输出，每项包含 id、ac、pr、ui、vc、vi、va、category_code。"""
+## 分类原则
+- 根据事件的核心安全问题分类，确实无法匹配时设为null
+
+必须以JSON数组输出，每项包含 id、ac、pr、ui、vc、vi、va、category_code。"""
         events_text = self._build_events_text(events, max_desc=800)
         messages = [
             {"role": "system", "content": system_prompt},

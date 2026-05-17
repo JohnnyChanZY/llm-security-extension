@@ -274,7 +274,11 @@ def _process_screening_phase(
 
         # LLM服务会自动分批、并发、等待
         security_results = llm_service.batch_check_security(events_data)
-        security_map = {r["id"]: r for r in security_results}
+        valid_results = [r for r in security_results if "id" in r]
+        invalid_count = len(security_results) - len(valid_results)
+        if invalid_count > 0:
+            logger.warning(f"安全判断结果中 {invalid_count} 条缺少id字段，已忽略")
+        security_map = {r["id"]: r for r in valid_results}
 
         for event in events_need_judge:
             result = security_map.get(event.id, {"is_security_event": True, "reason": "默认通过"})
@@ -315,7 +319,7 @@ def _process_rating_classify_phase(
     if mode == "both":
         # LLM服务会自动分批、并发、等待
         results = llm_service.batch_rate_and_classify(events_data, category_list)
-        result_map = {r["id"]: r for r in results}
+        result_map = _safe_result_map(results, "评级分类")
 
         for event in events:
             result = result_map.get(event.id, {})
@@ -325,7 +329,7 @@ def _process_rating_classify_phase(
 
     elif mode == "rate":
         results = llm_service.batch_rate_events(events_data)
-        result_map = {r["id"]: r for r in results}
+        result_map = _safe_result_map(results, "评级")
 
         for event in events:
             result = result_map.get(event.id, {})
@@ -334,7 +338,7 @@ def _process_rating_classify_phase(
 
     elif mode == "classify":
         results = llm_service.batch_classify_events(events_data, category_list)
-        result_map = {r["id"]: r for r in results}
+        result_map = _safe_result_map(results, "分类")
 
         for event in events:
             result = result_map.get(event.id, {})
@@ -409,12 +413,22 @@ def _identify_and_create_event_models(db: Session, event, event_type: str) -> in
     return created_count
 
 
+def _safe_result_map(results: List[Dict], context: str = "") -> Dict[Any, Dict]:
+    """从LLM结果列表构建 id->result 映射，过滤缺少id的条目"""
+    valid = [r for r in results if "id" in r]
+    invalid = len(results) - len(valid)
+    if invalid > 0:
+        logger.warning(f"{context}结果中 {invalid} 条缺少id字段，已忽略" if context else f"结果中 {invalid} 条缺少id字段，已忽略")
+    return {r["id"]: r for r in valid}
+
+
 # ============ 手动触发相关函数 ============
 
 def manual_process_events_async(
     event_ids: List[int],
     event_type: str,
-    mode: str = "rate"
+    mode: str = "rate",
+    run_judge_first: bool = False
 ):
     """
     手动触发处理（后台任务）
@@ -423,6 +437,7 @@ def manual_process_events_async(
         event_ids: 事件ID列表
         event_type: 事件类型 (historical/rss)
         mode: 处理模式 (rate/classify/both/check_security)
+        run_judge_first: 是否先执行安全判断再执行评级/分类
     """
     global _rating_status
 
@@ -447,6 +462,27 @@ def manual_process_events_async(
         # 获取分类列表
         categories = db.query(Category).filter(Category.is_active == True).all()
         category_list = [{"code": c.code, "name": c.name, "description": c.description} for c in categories]
+
+        llm_service = get_llm_service()
+
+        # 如果需要先执行安全判断
+        if run_judge_first and mode != "check_security":
+            logger.info(f"先执行安全判断: {len(events)} 条事件")
+            events_data = [
+                {"id": e.id, "title": e.title, "description": e.description, "raw_content": e.raw_content}
+                for e in events
+            ]
+            security_results = llm_service.batch_check_security(events_data)
+            valid_results = [r for r in security_results if "id" in r]
+            invalid_count = len(security_results) - len(valid_results)
+            if invalid_count > 0:
+                logger.warning(f"安全判断结果中 {invalid_count} 条缺少id字段，已忽略")
+            security_map = {r["id"]: r for r in valid_results}
+            for event in events:
+                result = security_map.get(event.id, {"is_security_event": True})
+                event.is_security_event = result.get("is_security_event", True)
+            db.commit()
+            logger.info(f"安全判断完成")
 
         # check_security 模式：处理所有事件
         # rate/classify/both 模式：只处理 is_security_event=True 的事件
@@ -497,8 +533,6 @@ def manual_process_events_async(
         # 设置进度回调
         set_progress_callback(_make_progress_callback())
 
-        llm_service = get_llm_service()
-
         # 一次性处理所有事件（LLM服务会自动分批、并发、等待，并通过回调更新进度）
         events_data = [
             {"id": e.id, "title": e.title, "description": e.description, "raw_content": e.raw_content}
@@ -510,7 +544,7 @@ def manual_process_events_async(
 
         if mode == "check_security":
             results = llm_service.batch_check_security(events_data)
-            result_map = {r["id"]: r for r in results}
+            result_map = _safe_result_map(results, "安全判断")
 
             for event in events_to_process:
                 result = result_map.get(event.id, {"is_security_event": True})
@@ -519,7 +553,7 @@ def manual_process_events_async(
 
         elif mode == "rate":
             results = llm_service.batch_rate_events(events_data)
-            result_map = {r["id"]: r for r in results}
+            result_map = _safe_result_map(results, "评级")
 
             for event in events_to_process:
                 result = result_map.get(event.id, {})
@@ -530,7 +564,7 @@ def manual_process_events_async(
 
         elif mode == "classify":
             results = llm_service.batch_classify_events(events_data, category_list)
-            result_map = {r["id"]: r for r in results}
+            result_map = _safe_result_map(results, "分类")
 
             for event in events_to_process:
                 result = result_map.get(event.id, {})
@@ -541,7 +575,7 @@ def manual_process_events_async(
 
         elif mode == "both":
             results = llm_service.batch_rate_and_classify(events_data, category_list)
-            result_map = {r["id"]: r for r in results}
+            result_map = _safe_result_map(results, "评级分类")
 
             for event in events_to_process:
                 result = result_map.get(event.id, {})
@@ -603,7 +637,7 @@ def _process_single_batch_manual(
 
     if mode == "check_security":
         results = llm_service.batch_check_security(events_data)
-        result_map = {r["id"]: r for r in results}
+        result_map = _safe_result_map(results, "安全判断")
 
         for event in events:
             result = result_map.get(event.id, {"is_security_event": True})
@@ -612,7 +646,7 @@ def _process_single_batch_manual(
 
     elif mode == "rate":
         results = llm_service.batch_rate_events(events_data)
-        result_map = {r["id"]: r for r in results}
+        result_map = _safe_result_map(results, "评级")
 
         for event in events:
             result = result_map.get(event.id, {})
@@ -623,7 +657,7 @@ def _process_single_batch_manual(
 
     elif mode == "classify":
         results = llm_service.batch_classify_events(events_data, category_list)
-        result_map = {r["id"]: r for r in results}
+        result_map = _safe_result_map(results, "分类")
 
         for event in events:
             result = result_map.get(event.id, {})
@@ -634,7 +668,7 @@ def _process_single_batch_manual(
 
     elif mode == "both":
         results = llm_service.batch_rate_and_classify(events_data, category_list)
-        result_map = {r["id"]: r for r in results}
+        result_map = _safe_result_map(results, "评级分类")
 
         for event in events:
             result = result_map.get(event.id, {})
@@ -704,7 +738,7 @@ def manual_process_events(
 
     if mode == "check_security":
         results = llm_service.batch_check_security(events_data)
-        result_map = {r["id"]: r for r in results}
+        result_map = _safe_result_map(results, "安全判断")
 
         for event in events_to_process:
             result = result_map.get(event.id, {"is_security_event": True})
@@ -713,7 +747,7 @@ def manual_process_events(
 
     elif mode == "rate":
         results = llm_service.batch_rate_events(events_data)
-        result_map = {r["id"]: r for r in results}
+        result_map = _safe_result_map(results, "评级")
 
         for event in events_to_process:
             result = result_map.get(event.id, {})
@@ -724,7 +758,7 @@ def manual_process_events(
 
     elif mode == "classify":
         results = llm_service.batch_classify_events(events_data, category_list)
-        result_map = {r["id"]: r for r in results}
+        result_map = _safe_result_map(results, "分类")
 
         for event in events_to_process:
             result = result_map.get(event.id, {})
@@ -735,7 +769,7 @@ def manual_process_events(
 
     elif mode == "both":
         results = llm_service.batch_rate_and_classify(events_data, category_list)
-        result_map = {r["id"]: r for r in results}
+        result_map = _safe_result_map(results, "评级分类")
 
         for event in events_to_process:
             result = result_map.get(event.id, {})
@@ -762,9 +796,9 @@ def auto_rate_events():
     auto_process_events()
 
 
-def manual_rate_events_async(event_ids: List[int], event_type: str, mode: str = "rate"):
+def manual_rate_events_async(event_ids: List[int], event_type: str, mode: str = "rate", run_judge_first: bool = False):
     """兼容旧函数名"""
-    manual_process_events_async(event_ids, event_type, mode)
+    manual_process_events_async(event_ids, event_type, mode, run_judge_first)
 
 
 def manual_rate_events(db: Session, event_ids: List[int], event_type: str, mode: str = "rate") -> dict:

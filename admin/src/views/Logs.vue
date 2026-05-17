@@ -35,6 +35,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { logsApi } from '@/api'
 
 const loading = ref(false)
 const logs = ref<any[]>([])
@@ -46,12 +47,11 @@ onMounted(() => loadLogs())
 async function loadLogs() {
   loading.value = true
   try {
-    // TODO: 调用API获取日志
-    // const result = await logsApi.getAll({ page: page.value })
-    // logs.value = result.data?.items || []
-    // total.value = result.data?.total || 0
-    logs.value = []
-    total.value = 0
+    const result: any = await logsApi.getAll({ page: page.value })
+    logs.value = result.data?.items || []
+    total.value = result.data?.total || 0
+  } catch (e) {
+    // ignore
   } finally {
     loading.value = false
   }

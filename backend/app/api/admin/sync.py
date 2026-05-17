@@ -15,6 +15,7 @@ from app.api.deps import get_current_admin
 from app.services.nvd_collector import nvd_collector
 from app.services.aiid_collector import aiid_collector
 from app.services.aivd_collector import aivd_collector
+from app.services.operation_logger import log_operation
 
 router = APIRouter()
 
@@ -173,6 +174,13 @@ def sync_nvd(
         llm_only: 是否只同步LLM相关的CVE，默认True
     """
     result = sync_nvd_task(days=days, llm_only=llm_only)
+
+    log_operation(
+        db, user_id=current_admin.id, action="sync_nvd",
+        target_type="data_sync",
+        details=f"同步NVD数据: {result['message']}"
+    )
+
     return ResponseModel(
         code=0,
         message="同步完成",
@@ -187,6 +195,13 @@ def sync_aiid(
 ):
     """触发AIID数据同步"""
     result = sync_aiid_task()
+
+    log_operation(
+        db, user_id=current_admin.id, action="sync_aiid",
+        target_type="data_sync",
+        details=f"同步AIID数据: {result['message']}"
+    )
+
     return ResponseModel(
         code=0,
         message="同步完成",
@@ -201,6 +216,13 @@ def sync_aivd(
 ):
     """触发AIVD数据同步"""
     result = sync_aivd_task()
+
+    log_operation(
+        db, user_id=current_admin.id, action="sync_aivd",
+        target_type="data_sync",
+        details=f"同步AIVD数据: {result['message']}"
+    )
+
     return ResponseModel(
         code=0,
         message="同步完成",

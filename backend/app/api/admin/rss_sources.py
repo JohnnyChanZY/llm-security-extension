@@ -16,6 +16,7 @@ from app.schemas.rss_source import (
 from app.schemas.response import ResponseModel
 from app.api.deps import get_current_admin, not_found_exception
 from app.tasks.rss_crawler import crawl_source, crawl_all_sources
+from app.services.operation_logger import log_operation
 
 router = APIRouter()
 
@@ -51,6 +52,12 @@ def create_rss_source(
     db.commit()
     db.refresh(source)
 
+    log_operation(
+        db, user_id=current_admin.id, action="create_rss_source",
+        target_type="rss_source", target_id=source.id,
+        details=f"创建RSS数据源: {source.name}"
+    )
+
     return ResponseModel(
         code=0,
         message="创建成功",
@@ -85,6 +92,12 @@ def update_rss_source(
     db.commit()
     db.refresh(source)
 
+    log_operation(
+        db, user_id=current_admin.id, action="update_rss_source",
+        target_type="rss_source", target_id=source.id,
+        details=f"更新RSS数据源: {source.name}"
+    )
+
     return ResponseModel(
         code=0,
         message="更新成功",
@@ -104,8 +117,15 @@ def delete_rss_source(
     if not source:
         raise not_found_exception("RSS数据源不存在")
 
+    source_name = source.name
     db.delete(source)
     db.commit()
+
+    log_operation(
+        db, user_id=current_admin.id, action="delete_rss_source",
+        target_type="rss_source", target_id=source_id,
+        details=f"删除RSS数据源: {source_name}"
+    )
 
     return ResponseModel(code=0, message="删除成功")
 

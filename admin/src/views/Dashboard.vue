@@ -98,7 +98,7 @@ import { ref, onMounted, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Document, Link, User, Box, Refresh, MagicStick, Setting } from '@element-plus/icons-vue'
-import { configApi, ratingApi } from '@/api'
+import { configApi, ratingApi, dashboardApi } from '@/api'
 
 const router = useRouter()
 
@@ -116,7 +116,7 @@ const config = reactive({
 })
 
 onMounted(async () => {
-  await loadConfig()
+  await Promise.all([loadConfig(), loadStats()])
 })
 
 async function loadConfig() {
@@ -124,6 +124,20 @@ async function loadConfig() {
     const result: any = await configApi.getLLM()
     if (result.data) {
       Object.assign(config, result.data)
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+async function loadStats() {
+  try {
+    const result: any = await dashboardApi.getStats()
+    if (result.data) {
+      stats.eventCount = result.data.eventCount || 0
+      stats.rssCount = result.data.rssCount || 0
+      stats.userCount = result.data.userCount || 0
+      stats.modelCount = result.data.modelCount || 0
     }
   } catch (e) {
     // ignore

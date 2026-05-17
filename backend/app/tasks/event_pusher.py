@@ -23,10 +23,11 @@ def push_pending_events():
 
     db = SessionLocal()
     try:
-        # 获取未推送且已处理的事件
+        # 获取未推送、已处理、且确认为安全事件的事件
         events = db.query(RSSEvent).filter(
             RSSEvent.is_pushed == False,
-            RSSEvent.is_processed == True
+            RSSEvent.is_processed == True,
+            RSSEvent.is_security_event == True
         ).limit(50).all()
 
         for event in events:

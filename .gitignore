@@ -90,3 +90,10 @@ prompt/
 .claude/
 
 notebook/
+
+# Development scripts (local logs and temp files)
+*.dev.log
+dev-*.log
+
+# Local development config
+.dev-config.local

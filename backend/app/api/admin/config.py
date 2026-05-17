@@ -11,6 +11,7 @@ from app.models.system_config import SystemConfig
 from app.schemas.config import ConfigResponse, ConfigUpdate, LLMConfigResponse
 from app.schemas.response import ResponseModel
 from app.api.deps import get_current_admin
+from app.services.operation_logger import log_operation
 
 router = APIRouter()
 
@@ -50,6 +51,12 @@ def update_config(
 
     db.commit()
     db.refresh(config)
+
+    log_operation(
+        db, user_id=current_admin.id, action="update_config",
+        target_type="system_config", target_id=config.id,
+        details=f"更新配置: {config_key}={update_data.config_value}"
+    )
 
     return ResponseModel(
         code=0,

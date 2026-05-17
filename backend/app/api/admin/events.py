@@ -14,6 +14,7 @@ from app.models.category import Category
 from app.schemas.response import ResponseModel, PaginatedData, PaginatedResponse
 from app.schemas.event import SeverityLevel
 from app.api.deps import get_current_admin
+from app.services.operation_logger import log_operation
 
 router = APIRouter()
 
@@ -309,6 +310,13 @@ def delete_rss_event(
 
     db.delete(event)
     db.commit()
+
+    log_operation(
+        db, user_id=current_admin.id, action="delete_rss_event",
+        target_type="rss_event", target_id=event_id,
+        details=f"删除RSS事件: ID={event_id}"
+    )
+
     return ResponseModel(message="删除成功")
 
 
@@ -325,6 +333,13 @@ def delete_historical_event(
 
     db.delete(event)
     db.commit()
+
+    log_operation(
+        db, user_id=current_admin.id, action="delete_historical_event",
+        target_type="historical_event", target_id=event_id,
+        details=f"删除历史事件: ID={event_id}"
+    )
+
     return ResponseModel(message="删除成功")
 
 
@@ -348,6 +363,12 @@ def batch_delete_events(
 
     deleted = db.query(Model).filter(Model.id.in_(event_ids)).delete(synchronize_session=False)
     db.commit()
+
+    log_operation(
+        db, user_id=current_admin.id, action="batch_delete_events",
+        target_type=event_table + "_event",
+        details=f"批量删除 {deleted} 条{event_table}事件"
+    )
 
     return ResponseModel(message=f"成功删除 {deleted} 条事件", data={"deleted": deleted})
 
